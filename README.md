@@ -4,13 +4,7 @@ Real-time shared inventory sync for **Crab Champions** co-op — a three-tier Lu
 
 ## How it works
 
-1. All players install the `Mods/CrabInventorySync/` folder into their UE4SS `Mods/` directory and set the same `roomCode` in `Scripts/config.txt` (or let auto-detection handle it — the room is derived from the session host's player name automatically).
-2. On mod load, `bridge.ps1` is auto-launched as a PowerShell window.
-3. Every 500 ms the mod reads your inventory and writes `push.json` if anything changed.
-4. The bridge detects the file change and POSTs it to the relay server.
-5. The server merges all players' inventories (sum of crystals, health, mods, perks, relics; newest player wins for weapon/ability/melee).
-6. The bridge writes the merged result to `recv.json`.
-7. Every player reads `recv.json` and applies it to their own character.
+Once installed, the mod runs entirely in the background. When you join a co-op session, all players' inventories — crystals, health, weapons, abilities, mods, perks, and relics — are automatically merged and kept in sync in real time. No setup or configuration is needed; the mod detects your session automatically.
 
 No "host" designation required — each client manages itself.
 
