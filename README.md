@@ -29,7 +29,6 @@ The bridge is auto-launched by the mod on game start. You don't need to run anyt
 ## Requirements
 
 - **Crab Champions** (Steam)
-- **UE4SS 3.x** — already bundled in this release, no separate download needed
 - **Windows 10 or 11** — PowerShell is built in, no extra install needed
 - **Node.js** — only needed if you are self-hosting the server
 
@@ -91,14 +90,6 @@ The public relay at `https://crab.dudiebug.net` is used by default. To run your 
 3. Set `serverUrl` in `config.txt` to your server address.
 
 The server exposes a live dashboard at `http://localhost:3000/` showing all active rooms, per-player inventories, and the merged result, updating every 500ms.
-
----
-
-## Known Limitations
-
-- **Mod slot counts are fixed.** Items can be swapped within your existing slots, but new slots cannot be added. This is a hard UE4SS TArray limitation — the game doesn't process slot count changes via Lua reflection.
-- **Room auto-detection requires an active multiplayer session.** In solo play or the main menu, the fallback `roomCode` from config is used instead.
-- **Crystals or health reading as 0?** Use the debug tools (see below) to find the correct internal property name for your game version and update `config.txt`.
 
 ---
 
