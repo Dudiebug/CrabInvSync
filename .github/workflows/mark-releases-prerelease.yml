@@ -1,0 +1,40 @@
+name: Mark All Releases as Unstable Pre-release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mark-prerelease:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark all releases as pre-release and rename them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          REPO="${{ github.repository }}"
+          echo "Processing releases for $REPO"
+
+          # Get all releases (up to 100)
+          RELEASES=$(gh api repos/$REPO/releases --paginate -q '.[] | "\(.id) \(.tag_name)"')
+
+          COUNTER=1
+          echo "$RELEASES" | while read -r RELEASE_ID TAG_NAME; do
+            echo "Updating release $TAG_NAME (ID: $RELEASE_ID) -> prerelease #$COUNTER"
+
+            gh api -X PATCH repos/$REPO/releases/$RELEASE_ID \
+              -f name="[UNSTABLE] Pre-release #$COUNTER — $TAG_NAME" \
+              -f body="⚠️ **This release is unstable and does not work correctly.** Do not use.
+
+This release has been marked as a pre-release. It may contain bugs, crashes, or missing functionality." \
+              -F prerelease=true \
+              -F draft=false
+
+            COUNTER=$((COUNTER + 1))
+          done
+
+          echo "Done — all releases marked as unstable pre-releases."
