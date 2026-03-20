@@ -559,6 +559,11 @@ local function applyInventory(ps, inv)
             local newA = (SYNC_ABILITY and inv.ability ~= "") and inv.ability or curA
             local newM = (SYNC_MELEE   and inv.melee   ~= "") and inv.melee   or curM
 
+            -- In the lobby the player has no loadout yet; calling ServerEquipInventory
+            -- before the inventory system is initialized crashes the game (SEH).
+            -- Only apply if the player already has at least one item equipped.
+            if curW == "" and curA == "" and curM == "" then return end
+
             -- Block apply if debounce detects mid-pick (game value ≠ stable value)
             if SYNC_WEAPON  and stableW and curW ~= stableW then newW = curW end
             if SYNC_ABILITY and stableA and curA ~= stableA then newA = curA end
@@ -609,28 +614,12 @@ local function applyInventory(ps, inv)
         end)
     end
 
-    -- Slot counts: increment to match merged max BEFORE filling arrays
-    if SYNC_SLOTS and inv.slots then
-        local slotMap = {
-            { key = "weaponMods",  pickupType = PICKUP_WEAPON_MOD,  prop = "NumWeaponModSlots"  },
-            { key = "abilityMods", pickupType = PICKUP_ABILITY_MOD, prop = "NumAbilityModSlots" },
-            { key = "meleeMods",   pickupType = PICKUP_MELEE_MOD,   prop = "NumMeleeModSlots"   },
-            { key = "perks",       pickupType = PICKUP_PERK,        prop = "NumPerkSlots"       },
-        }
-        for _, s in ipairs(slotMap) do
-            local target = inv.slots[s.key] or 0
-            if target > 0 then
-                pcall(function()
-                    local current = tonumber(ps:GetPropertyValue(s.prop)) or 0
-                    while current < target do
-                        ps:ServerIncrementNumInventorySlots(s.pickupType, 0)
-                        current = current + 1
-                    end
-                    lastAppliedSlots[s.key] = target
-                end)
-            end
-        end
-    end
+    -- NOTE: ServerIncrementNumInventorySlots is intentionally NOT called here.
+    -- This RPC crashes (ACCESS_VIOLATION) when called before the island inventory
+    -- system initializes — which includes the lobby and the early join phase.
+    -- Slot counts are still READ and PUSHED to the server so peers see your slot
+    -- totals, and fillSlots below will fill whatever slots already exist.
+    -- Unlocking new slots is left to the game's normal pickup flow.
 
     -- Mod/perk/relic arrays: fill existing slots with merged items
     local function fillSlots(propName, daField, daList, sourceNames)
