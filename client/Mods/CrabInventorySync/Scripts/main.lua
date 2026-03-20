@@ -1,4 +1,4 @@
--- CrabInventorySync v0.0.1 — main.lua
+-- CrabInventorySync v0.0.2 — main.lua
 -- Ground-up rebuild.  Full inventory sync between multiplayer session members
 -- via a PowerShell bridge and Node.js relay server.
 --
@@ -833,6 +833,6 @@ ExecuteWithDelay(STARTUP_MS, function()
 end)
 
 print(string.format(
-    "[CrabSync] v0.0.1 loaded. First sync in %.1f s, then every %d ms. Press F9 to force.\n",
+    "[CrabSync] v0.0.2 loaded. First sync in %.1f s, then every %d ms. Press F9 to force.\n",
     STARTUP_MS / 1000, POLL_MS
 ))

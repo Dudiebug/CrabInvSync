@@ -1,6 +1,6 @@
 {
   "name": "crab-inventory-sync-bridge",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "CrabInventorySync client mod (UE4SS Lua + PowerShell bridge)",
   "main": "bridge.ps1"
 }
