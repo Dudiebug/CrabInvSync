@@ -1,5 +1,5 @@
 -- Uncomment the line below to enable debug keybinds (F6/F7/F8/F10). Remove when done.
-require("debug_helpers")
+-- require("debug_helpers")
 -- require("debug_perks")
 
 -- CrabInventorySync - main.lua
@@ -676,7 +676,7 @@ local function applyInventory(ps, inv)
         { flag=SYNC_PERKS,        prop="Perks",       pickupType=7, needed=inv.perkSlots       or 0 },
         { flag=SYNC_RELICS,       prop="Relics",      pickupType=8, needed=inv.relicSlots      or 0 },
     }) do
-        if se.flag and se.needed > 0 then
+        if se.flag and se.needed > 0 and hasEverPushed then
             local current = countSlots(ps, se.prop)
             for _ = current + 1, se.needed do
                 pcall(function() ps:ServerIncrementNumInventorySlots(se.pickupType, 0) end)
@@ -792,6 +792,7 @@ local lastPushedJson  = ""     -- inventory JSON last written to push.json (chan
 local lastRecvJson    = ""     -- JSON we last applied from recv.json
 local isTransitioning = false  -- pauses polling during level transitions
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
+local hasEverPushed   = false  -- guard: don't call Server RPCs until we've synced at least once
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
 
 -- Crystal delta-tracking — prevents the feedback loop caused by applying the server's
@@ -841,6 +842,7 @@ local function pushIfChanged()
         f:write(payload)
         f:close()
         lastPushedJson = invJson   -- store only the inv portion for change detection
+        hasEverPushed  = true
         skipNextApply  = true      -- give bridge one tick to process push before we apply
         print("[CrabInventorySync] Change detected — pushed to bridge.\n")
     end
@@ -900,6 +902,7 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
+        hasEverPushed   = false
         -- Reset delta-trackers so the first read in the new level re-initialises
         -- cleanly (avoids a large negative delta from the old applied total vs.
         -- the new level's starting values).
