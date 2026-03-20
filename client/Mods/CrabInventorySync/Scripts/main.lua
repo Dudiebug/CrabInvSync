@@ -50,7 +50,6 @@ local POLL_MS       = 500    -- main loop interval
 local STARTUP_MS    = 5000   -- wait before first game-object access
 local SUSPEND_MS    = 5000   -- pause after level transition / probe failure
 local STABLE_TICKS  = 3      -- debounce window for weapon/ability/melee
-local PERIODIC_TICKS = 6     -- force a read even without dirty flag (6 × 500ms = 3 s)
 
 -- Pickup type enum for ServerIncrementNumInventorySlots
 local PICKUP_WEAPON_MOD  = 4
@@ -340,10 +339,6 @@ local lastRecvJson   = ""
 -- Apply pause: skip one apply cycle after a push so bridge can update recv.json
 local applyBlocked = false
 
--- Event-driven dirty flag — set by OnRep hooks, cleared after read
-local dirty = false
-local periodicCounter = 0   -- counts ticks since last forced read
-
 -- Debounce state for weapon/ability/melee
 local pendingW = nil;  local countW = 0;  local stableW = nil
 local pendingA = nil;  local countA = 0;  local stableA = nil
@@ -369,8 +364,6 @@ local function resetTrackers()
     lastPushedJson = ""
     lastRecvJson   = ""
     applyBlocked   = false
-    dirty          = false
-    periodicCounter = 0
     pendingW = nil;  countW = 0;  stableW = nil
     pendingA = nil;  countA = 0;  stableA = nil
     pendingM = nil;  countM = 0;  stableM = nil
@@ -779,13 +772,8 @@ local function tick()
             goto reschedule
         end
 
-        -- Read + push when dirty (OnRep hook fired) or periodic fallback
-        periodicCounter = periodicCounter + 1
-        if dirty or periodicCounter >= PERIODIC_TICKS then
-            pushIfChanged(ps)
-            dirty = false
-            periodicCounter = 0
-        end
+        -- Read + push every tick (500ms polling — near-real-time, no hooks needed)
+        pushIfChanged(ps)
 
         -- Apply recv.json
         applyIfChanged(ps)
@@ -803,36 +791,14 @@ end
 loadConfig()
 autoLaunchBridge()
 
--- OnRep hooks — event-driven change detection for near-instant sync
-local function markDirty() dirty = true end
-local hookPaths = {
-    "/Script/CrabChampions.CrabPS:OnRep_WeaponDA",
-    "/Script/CrabChampions.CrabPS:OnRep_AbilityDA",
-    "/Script/CrabChampions.CrabPS:OnRep_MeleeDA",
-    "/Script/CrabChampions.CrabPS:OnRep_Crystals",
-    "/Script/CrabChampions.CrabPS:OnRep_Inventory",
-}
-for _, path in ipairs(hookPaths) do
-    local ok, err = pcall(RegisterHook, path, markDirty)
-    if ok then
-        print("[CrabSync] Hook: " .. path .. "\n")
-    else
-        print("[CrabSync] Hook FAILED: " .. path .. " — " .. tostring(err) .. "\n")
-    end
-end
-
--- Level transition: pause sync to avoid accessing mid-destruction objects
-local okHook, errHook = pcall(RegisterHook,
-    "/Script/CrabChampions.CrabPC:ClientOnClearedIsland",
-    function()
-        suspend("level transition")
-    end
-)
-if okHook then
-    print("[CrabSync] Hook: ClientOnClearedIsland\n")
-else
-    print("[CrabSync] Hook FAILED: ClientOnClearedIsland — " .. tostring(errHook) .. "\n")
-end
+-- NOTE: No RegisterHook calls are used intentionally.
+-- OnRep hooks on CrabPS fire for ALL players' PlayerStates during multiplayer join
+-- (replication storm), not just the local player's. UE4SS crashes (SEH 0xe06d7363)
+-- marshaling partially-initialized PS objects from other players into Lua userdata.
+-- pcall() cannot catch native SEH exceptions — they kill the GameThread.
+-- Solution: pure 500ms polling via the tick loop. pushIfChanged() only writes
+-- push.json when inventory actually changes, so bandwidth is unchanged.
+-- Level transitions are handled by probe() failure → suspend() → auto-recover.
 
 -- F9: force immediate full resync
 RegisterKeyBind(Key.F9, function()
