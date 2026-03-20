@@ -559,15 +559,15 @@ local function applyInventory(ps, inv)
             local newA = (SYNC_ABILITY and inv.ability ~= "") and inv.ability or curA
             local newM = (SYNC_MELEE   and inv.melee   ~= "") and inv.melee   or curM
 
-            -- In the lobby the player has no loadout yet; calling ServerEquipInventory
-            -- before the inventory system is initialized crashes the game (SEH).
-            -- Only apply if the player already has at least one item equipped.
-            if curW == "" and curA == "" and curM == "" then return end
-
             -- Block apply if debounce detects mid-pick (game value ≠ stable value)
             if SYNC_WEAPON  and stableW and curW ~= stableW then newW = curW end
             if SYNC_ABILITY and stableA and curA ~= stableA then newA = curA end
             if SYNC_MELEE   and stableM and curM ~= stableM then newM = curM end
+
+            -- In the lobby the player has no loadout yet; calling ServerEquipInventory
+            -- before the inventory system is initialized crashes the game (SEH).
+            -- Only apply if the player already has at least one item equipped.
+            if curW == "" and curA == "" and curM == "" then return end
 
             if newW == curW and newA == curA and newM == curM then return end
 
