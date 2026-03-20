@@ -601,7 +601,11 @@ local function applyInventory(ps, inv)
             local maxHp = nil
             pcall(function() maxHp = hi.CurrentMaxHealth end)
             anchorHealth = (maxHp and maxHp > 0) and math.min(inv.health, maxHp) or inv.health
-            pcall(function() hc:OnRep_HealthInfo() end)
+            -- NOTE: hc:OnRep_HealthInfo() intentionally omitted.
+            -- Calling OnRep functions directly outside the replication context
+            -- causes a null-pointer dereference (SEH 0xC0000005) inside the game's
+            -- health system when called during or shortly after a multiplayer join.
+            -- The property write above is sufficient for sync purposes.
         end)
     end
 
@@ -637,9 +641,12 @@ local function applyInventory(ps, inv)
             local idx = 1
             arr:ForEach(function(_, elem)
                 if sourceNames[idx] then
-                    local da = findDA(daList, sourceNames[idx])
-                    if da then
-                        pcall(function() elem:get():SetPropertyValue(daField, da) end)
+                    local okv, valid = pcall(function() return elem:get():IsValid() end)
+                    if okv and valid then
+                        local da = findDA(daList, sourceNames[idx])
+                        if da then
+                            pcall(function() elem:get():SetPropertyValue(daField, da) end)
+                        end
                     end
                     idx = idx + 1
                 end
@@ -775,8 +782,17 @@ local function tick()
         -- Read + push every tick (500ms polling — near-real-time, no hooks needed)
         pushIfChanged(ps)
 
-        -- Apply recv.json
-        applyIfChanged(ps)
+        -- Apply recv.json only when the pawn is spawned and valid.
+        -- RPCs (ServerEquipInventory, ServerIncrementNumInventorySlots) and direct
+        -- OnRep calls crash with ACCESS_VIOLATION if the game's inventory/health
+        -- systems haven't finished initializing post-join (pawn not yet spawned).
+        local pawnOk, pawn = pcall(function() return ps:GetPropertyValue("PawnPrivate") end)
+        if pawnOk and type(pawn) == "userdata" then
+            local pvOk, pawnValid = pcall(function() return pawn:IsValid() end)
+            if pvOk and pawnValid then
+                applyIfChanged(ps)
+            end
+        end
     end
 
     -- STATE_SUSPENDED: do nothing, auto-recover timer handles transition
