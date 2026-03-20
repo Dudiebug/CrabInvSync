@@ -16,6 +16,8 @@
 --      No "host" designation is needed — each client handles itself.
 --
 -- LIMITATIONS:
+--   - Mod slot counts are fixed by what each player already has; we can swap items
+--     within existing slots but cannot add new slots (UE4 TArray limitation via UE4SS).
 --   - Crystals property name is guessed; adjust crystalsProperty in config.txt if needed.
 --   - PowerShell must be available (built into Windows 10/11 — no extra install needed).
 --
@@ -108,8 +110,7 @@ end
 local function encodeInventory(inv)
     return string.format(
         '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,"health":%.3f,"maxHealth":%.3f,' ..
-        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s,' ..
-        '"weaponModSlots":%d,"abilityModSlots":%d,"meleeModSlots":%d,"perkSlots":%d,"relicSlots":%d}',
+        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s}',
         jsonStr(inv.weapon),
         jsonStr(inv.ability),
         jsonStr(inv.melee),
@@ -120,12 +121,7 @@ local function encodeInventory(inv)
         jsonStrArray(inv.abilityMods),
         jsonStrArray(inv.meleeMods),
         jsonStrArray(inv.perks),
-        jsonStrArray(inv.relics),
-        math.floor(tonumber(inv.weaponModSlots)  or 0),
-        math.floor(tonumber(inv.abilityModSlots) or 0),
-        math.floor(tonumber(inv.meleeModSlots)   or 0),
-        math.floor(tonumber(inv.perkSlots)       or 0),
-        math.floor(tonumber(inv.relicSlots)      or 0)
+        jsonStrArray(inv.relics)
     )
 end
 
@@ -156,11 +152,6 @@ local function decodeInventory(json)
     inv.meleeMods   = strArray(json, "meleeMods")
     inv.perks       = strArray(json, "perks")
     inv.relics      = strArray(json, "relics")
-    inv.weaponModSlots  = tonumber(json:match('"weaponModSlots"%s*:%s*(%d+)'))  or 0
-    inv.abilityModSlots = tonumber(json:match('"abilityModSlots"%s*:%s*(%d+)')) or 0
-    inv.meleeModSlots   = tonumber(json:match('"meleeModSlots"%s*:%s*(%d+)'))   or 0
-    inv.perkSlots       = tonumber(json:match('"perkSlots"%s*:%s*(%d+)'))       or 0
-    inv.relicSlots      = tonumber(json:match('"relicSlots"%s*:%s*(%d+)'))      or 0
     return inv
 end
 
@@ -185,16 +176,6 @@ local function findDA(daList, name)
         end
     end
     return nil
-end
-
--- Count total slots (filled or empty) in a TArray property on ps.
-local function countSlots(ps, propName)
-    local n = 0
-    pcall(function()
-        local arr = ps:GetPropertyValue(propName)
-        if arr then arr:ForEach(function() n = n + 1 end) end
-    end)
-    return n
 end
 
 -- Read all mod/perk/relic slots on ps and return a name→count table.
@@ -377,8 +358,7 @@ local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 local function readInventory(ps)
     local inv = {
         weapon = "", ability = "", melee = "", crystals = 0, health = 0, maxHealth = 0,
-        weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {},
-        weaponModSlots = 0, abilityModSlots = 0, meleeModSlots = 0, perkSlots = 0, relicSlots = 0,
+        weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {}
     }
     if not ps then return inv end
     local okv = pcall(function() return ps:IsValid() end)
@@ -507,15 +487,6 @@ local function readInventory(ps)
             for _ = 1, count do table.insert(inv[cat.inv], name) end
         end
     end
-
-    -- Slot counts: how many TArray slots this player has unlocked per category.
-    -- Pushed to server so the max across players propagates back and all clients
-    -- call ServerIncrementNumInventorySlots to match before writing items.
-    inv.weaponModSlots  = countSlots(ps, "WeaponMods")
-    inv.abilityModSlots = countSlots(ps, "AbilityMods")
-    inv.meleeModSlots   = countSlots(ps, "MeleeMods")
-    inv.perkSlots       = countSlots(ps, "Perks")
-    inv.relicSlots      = countSlots(ps, "Relics")
 
     return inv
 end
@@ -664,26 +635,6 @@ local function applyInventory(ps, inv)
         end)
     end
 
-    -- Expand slots to match the merged counts before writing items.
-    -- If a player has 0 perk slots locally but the merged inventory has 3 perks,
-    -- calling ServerIncrementNumInventorySlots creates the missing slots so
-    -- applySlotArray can overwrite them on this tick (listen-server) or the next.
-    -- ECrabPickupType: WeaponMod=4, AbilityMod=5, MeleeMod=6, Perk=7, Relic=8
-    for _, se in ipairs({
-        { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  pickupType=4, needed=inv.weaponModSlots  or 0 },
-        { flag=SYNC_ABILITY_MODS, prop="AbilityMods", pickupType=5, needed=inv.abilityModSlots or 0 },
-        { flag=SYNC_MELEE_MODS,   prop="MeleeMods",   pickupType=6, needed=inv.meleeModSlots   or 0 },
-        { flag=SYNC_PERKS,        prop="Perks",       pickupType=7, needed=inv.perkSlots       or 0 },
-        { flag=SYNC_RELICS,       prop="Relics",      pickupType=8, needed=inv.relicSlots      or 0 },
-    }) do
-        if se.flag and se.needed > 0 and hasEverPushed then
-            local current = countSlots(ps, se.prop)
-            for _ = current + 1, se.needed do
-                pcall(function() ps:ServerIncrementNumInventorySlots(se.pickupType, 0) end)
-            end
-        end
-    end
-
     -- Apply each category then immediately anchor the delta-tracker so the next
     -- readInventory sees delta = 0 for synced items (same technique as crystals/health).
     -- We re-read the actual TArray after writing rather than assuming all items landed,
@@ -792,7 +743,6 @@ local lastPushedJson  = ""     -- inventory JSON last written to push.json (chan
 local lastRecvJson    = ""     -- JSON we last applied from recv.json
 local isTransitioning = false  -- pauses polling during level transitions
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
-local hasEverPushed   = false  -- guard: don't call Server RPCs until we've synced at least once
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
 
 -- Crystal delta-tracking — prevents the feedback loop caused by applying the server's
@@ -842,7 +792,6 @@ local function pushIfChanged()
         f:write(payload)
         f:close()
         lastPushedJson = invJson   -- store only the inv portion for change detection
-        hasEverPushed  = true
         skipNextApply  = true      -- give bridge one tick to process push before we apply
         print("[CrabInventorySync] Change detected — pushed to bridge.\n")
     end
@@ -902,7 +851,6 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
-        hasEverPushed   = false
         -- Reset delta-trackers so the first read in the new level re-initialises
         -- cleanly (avoids a large negative delta from the old applied total vs.
         -- the new level's starting values).

@@ -74,11 +74,6 @@ function mergeInventories(room) {
         meleeMods:   [],
         perks:       [],
         relics:      [],
-        weaponModSlots:  0,
-        abilityModSlots: 0,
-        meleeModSlots:   0,
-        perkSlots:       0,
-        relicSlots:      0,
     };
 
     // Clients delta-track their own contributions so they never push items received
@@ -100,10 +95,6 @@ function mergeInventories(room) {
             for (const name of (inv[key] || [])) {
                 if (name) modCounts[key][name] = (modCounts[key][name] || 0) + 1;
             }
-        }
-        // Slot counts: take the max across all players so everyone gets the most unlocked.
-        for (const key of ['weaponModSlots', 'abilityModSlots', 'meleeModSlots', 'perkSlots', 'relicSlots']) {
-            if ((inv[key] || 0) > merged[key]) merged[key] = inv[key];
         }
     }
 
@@ -135,11 +126,11 @@ app.post('/push', (req, res) => {
         `  melee      : ${inventory.melee || '(none)'}\n` +
         `  crystals   : ${inventory.crystals ?? 0}\n` +
         `  health     : ${inventory.health ?? 0}\n` +
-        `  weaponMods : ${fmt(inventory.weaponMods)} (slots:${inventory.weaponModSlots ?? 0})\n` +
-        `  abilityMods: ${fmt(inventory.abilityMods)} (slots:${inventory.abilityModSlots ?? 0})\n` +
-        `  meleeMods  : ${fmt(inventory.meleeMods)} (slots:${inventory.meleeModSlots ?? 0})\n` +
-        `  perks      : ${fmt(inventory.perks)} (slots:${inventory.perkSlots ?? 0})\n` +
-        `  relics     : ${fmt(inventory.relics)} (slots:${inventory.relicSlots ?? 0})`
+        `  weaponMods : ${fmt(inventory.weaponMods)}\n` +
+        `  abilityMods: ${fmt(inventory.abilityMods)}\n` +
+        `  meleeMods  : ${fmt(inventory.meleeMods)}\n` +
+        `  perks      : ${fmt(inventory.perks)}\n` +
+        `  relics     : ${fmt(inventory.relics)}`
     );
 
     res.json({ inventory: merged });
