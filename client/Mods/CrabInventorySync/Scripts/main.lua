@@ -162,8 +162,10 @@ local function getDAName(da)
     if not da then return "" end
     local ok, v = pcall(function() return da:IsValid() end)
     if not ok or not v then return "" end
-    local ok2, name = pcall(function() return da.Name:ToString() end)
-    return (ok2 and name) and name or ""
+    local ok2, nameObj = pcall(function() return da:GetPropertyValue("Name") end)
+    if not ok2 or not nameObj then return "" end
+    local ok3, name = pcall(function() return nameObj:ToString() end)
+    return (ok3 and name) and name or ""
 end
 
 local function findDA(daList, name)
@@ -171,8 +173,11 @@ local function findDA(daList, name)
     for _, da in ipairs(daList) do
         local ok, v = pcall(function() return da:IsValid() end)
         if ok and v then
-            local ok2, n = pcall(function() return da.Name:ToString() end)
-            if ok2 and n == name then return da end
+            local ok2, nameObj = pcall(function() return da:GetPropertyValue("Name") end)
+            if ok2 and nameObj then
+                local ok3, n = pcall(function() return nameObj:ToString() end)
+                if ok3 and n == name then return da end
+            end
         end
     end
     return nil
@@ -187,7 +192,7 @@ local function computeSlotCounts(ps, propName, daField)
         if not arr then return end
         arr:ForEach(function(_, elem)
             if elem:get():IsValid() then
-                local ok, da = pcall(function() return elem:get()[daField] end)
+                local ok, da = pcall(function() return elem:get():GetPropertyValue(daField) end)
                 if ok and da then
                     local name = getDAName(da)
                     if name ~= "" then
@@ -370,7 +375,7 @@ local function readInventory(ps)
     -- On first read the initial value is accepted immediately (no delay).
     if SYNC_WEAPON then
         local cur = ""
-        pcall(function() cur = getDAName(ps.WeaponDA) end)
+        pcall(function() cur = getDAName(ps:GetPropertyValue("WeaponDA")) end)
         if cur ~= pendingWeapon then
             pendingWeapon = cur;  pendingWCount = 1
             if stableWeapon == nil then stableWeapon = cur end   -- accept initial value immediately
@@ -382,7 +387,7 @@ local function readInventory(ps)
     end
     if SYNC_ABILITY then
         local cur = ""
-        pcall(function() cur = getDAName(ps.AbilityDA) end)
+        pcall(function() cur = getDAName(ps:GetPropertyValue("AbilityDA")) end)
         if cur ~= pendingAbility then
             pendingAbility = cur;  pendingACount = 1
             if stableAbility == nil then stableAbility = cur end
@@ -394,7 +399,7 @@ local function readInventory(ps)
     end
     if SYNC_MELEE then
         local cur = ""
-        pcall(function() cur = getDAName(ps.MeleeDA) end)
+        pcall(function() cur = getDAName(ps:GetPropertyValue("MeleeDA")) end)
         if cur ~= pendingMelee then
             pendingMelee = cur;  pendingMCount = 1
             if stableMelee == nil then stableMelee = cur end
@@ -513,9 +518,9 @@ local function applyInventory(ps, inv)
         pcall(function()
             -- Only call ServerEquipInventory if a name actually changed — calling
             -- it unnecessarily resets ammo, fire rate, and other weapon state.
-            local curWeapon  = getDAName(ps.WeaponDA)
-            local curAbility = getDAName(ps.AbilityDA)
-            local curMelee   = getDAName(ps.MeleeDA)
+            local curWeapon  = getDAName(ps:GetPropertyValue("WeaponDA"))
+            local curAbility = getDAName(ps:GetPropertyValue("AbilityDA"))
+            local curMelee   = getDAName(ps:GetPropertyValue("MeleeDA"))
             local newWeapon  = (SYNC_WEAPON  and inv.weapon  ~= "") and inv.weapon  or curWeapon
             local newAbility = (SYNC_ABILITY and inv.ability ~= "") and inv.ability or curAbility
             local newMelee   = (SYNC_MELEE   and inv.melee   ~= "") and inv.melee   or curMelee
@@ -540,9 +545,9 @@ local function applyInventory(ps, inv)
                 --    tostring(blockedW), tostring(blockedA), tostring(blockedM)))
             end
             if newWeapon == curWeapon and newAbility == curAbility and newMelee == curMelee then return end
-            local weapon  = findDA(weaponDAs,  newWeapon)  or ps.WeaponDA
-            local ability = findDA(abilityDAs, newAbility) or ps.AbilityDA
-            local melee   = findDA(meleeDAs,   newMelee)   or ps.MeleeDA
+            local weapon  = findDA(weaponDAs,  newWeapon)  or ps:GetPropertyValue("WeaponDA")
+            local ability = findDA(abilityDAs, newAbility) or ps:GetPropertyValue("AbilityDA")
+            local melee   = findDA(meleeDAs,   newMelee)   or ps:GetPropertyValue("MeleeDA")
             if weapon and ability and melee then
                 --print(string.format(
                 --    "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
@@ -619,7 +624,7 @@ local function applyInventory(ps, inv)
             arr:ForEach(function(_, elem)
                 if writeIdx > #toWrite then return end
                 if elem:get():IsValid() then
-                    local ok, curDA = pcall(function() return elem:get()[daField] end)
+                    local ok, curDA = pcall(function() return elem:get():GetPropertyValue(daField) end)
                     local curName = (ok and curDA) and getDAName(curDA) or ""
                     if ownSkip[curName] and ownSkip[curName] > 0 then
                         ownSkip[curName] = ownSkip[curName] - 1
@@ -627,7 +632,7 @@ local function applyInventory(ps, inv)
                     end
                     local da = findDA(daList, toWrite[writeIdx])
                     if da then
-                        pcall(function() elem:get()[daField] = da end)
+                        pcall(function() elem:get():SetPropertyValue(daField, da) end)
                         writeIdx = writeIdx + 1
                     end
                 end
