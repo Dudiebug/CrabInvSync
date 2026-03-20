@@ -207,9 +207,15 @@ local function probe()
     local ok2, ps = pcall(function() return pc:GetPropertyValue("PlayerState") end)
     if not ok2 or type(ps) ~= "userdata" then return nil end
 
+    -- IsValid() null-checks the underlying C++ pointer before dereferencing.
+    -- This catches the multiplayer join race where PS exists as a Lua wrapper
+    -- but the C++ object hasn't been replicated yet (null pointer inside).
+    local ok3, valid = pcall(function() return ps:IsValid() end)
+    if not ok3 or not valid then return nil end
+
     -- Canary: Crystals is always present on CrabPS and always a number.
-    local ok3, canary = pcall(function() return ps:GetPropertyValue("Crystals") end)
-    if not ok3 or type(canary) ~= "number" then return nil end
+    local ok4, canary = pcall(function() return ps:GetPropertyValue(CRYSTALS_PROPERTY) end)
+    if not ok4 or type(canary) ~= "number" then return nil end
 
     return ps
 end
