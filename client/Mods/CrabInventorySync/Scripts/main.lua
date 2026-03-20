@@ -590,17 +590,46 @@ local function applyInventory(ps, inv)
         end)
     end
 
-    local function applySlotArray(propName, daField, daList, sourceNames)
-        if #sourceNames == 0 or not daList or #daList == 0 then return end
+    local function applySlotArray(propName, daField, daList, sourceNames, ownItems)
+        if not daList or #daList == 0 then return end
+
+        -- Compute items that need writing: sourceNames minus what we already own in-slot.
+        -- This prevents overwriting a slot that already has one of our own items with
+        -- someone else's item (e.g. merged list = [RemotePerk, YourPerk] → slot 0 written
+        -- with RemotePerk, clobbering YourPerk).
+        local toWrite = {}
+        local ownRemaining = {}
+        for name, count in pairs(ownItems or {}) do ownRemaining[name] = count end
+        for _, name in ipairs(sourceNames) do
+            if ownRemaining[name] and ownRemaining[name] > 0 then
+                ownRemaining[name] = ownRemaining[name] - 1   -- already in a slot, skip
+            else
+                table.insert(toWrite, name)
+            end
+        end
+        if #toWrite == 0 then return end
+
+        -- Write toWrite items only to slots that don't contain one of our own items.
+        local ownSkip = {}
+        for name, count in pairs(ownItems or {}) do ownSkip[name] = count end
+        local writeIdx = 1
         pcall(function()
             local arr = ps:GetPropertyValue(propName)
             if not arr then return end
-            local idx = 1
             arr:ForEach(function(_, elem)
-                if elem:get():IsValid() and sourceNames[idx] then
-                    local da = findDA(daList, sourceNames[idx])
-                    if da then pcall(function() elem:get()[daField] = da end) end
-                    idx = idx + 1
+                if writeIdx > #toWrite then return end
+                if elem:get():IsValid() then
+                    local ok, curDA = pcall(function() return elem:get()[daField] end)
+                    local curName = (ok and curDA) and getDAName(curDA) or ""
+                    if ownSkip[curName] and ownSkip[curName] > 0 then
+                        ownSkip[curName] = ownSkip[curName] - 1
+                        return   -- preserve our own item in this slot
+                    end
+                    local da = findDA(daList, toWrite[writeIdx])
+                    if da then
+                        pcall(function() elem:get()[daField] = da end)
+                        writeIdx = writeIdx + 1
+                    end
                 end
             end)
         end)
@@ -618,7 +647,7 @@ local function applyInventory(ps, inv)
         { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      list=relicDAs,      src=inv.relics,      key="relics"      },
     }) do
         if entry.flag then
-            applySlotArray(entry.prop, entry.da, entry.list, entry.src)
+            applySlotArray(entry.prop, entry.da, entry.list, entry.src, ownModCounts[entry.key])
             -- Anchor to what we INTENDED to write, not computeSlotCounts.
             -- Reading the slot immediately after writing via UE4SS reflection returns
             -- the pre-write value for that tick (the game hasn't processed it yet).
