@@ -1,7 +1,6 @@
 -- Uncomment the line below to enable debug keybinds (F6/F7/F8). Remove when done.
 -- require("debug")
 -- require("debug_perks")
--- require("perk_tastyorange_mod")
 
 -- CrabInventorySync - main.lua
 -- Syncs inventory between all players in a multiplayer session via a PowerShell bridge.
