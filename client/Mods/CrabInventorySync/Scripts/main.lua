@@ -162,10 +162,8 @@ local function getDAName(da)
     if not da then return "" end
     local ok, v = pcall(function() return da:IsValid() end)
     if not ok or not v then return "" end
-    local ok2, nameObj = pcall(function() return da:GetPropertyValue("Name") end)
-    if not ok2 or not nameObj then return "" end
-    local ok3, name = pcall(function() return nameObj:ToString() end)
-    return (ok3 and name) and name or ""
+    local ok2, name = pcall(function() return da.Name:ToString() end)
+    return (ok2 and name) and name or ""
 end
 
 local function findDA(daList, name)
@@ -173,11 +171,8 @@ local function findDA(daList, name)
     for _, da in ipairs(daList) do
         local ok, v = pcall(function() return da:IsValid() end)
         if ok and v then
-            local ok2, nameObj = pcall(function() return da:GetPropertyValue("Name") end)
-            if ok2 and nameObj then
-                local ok3, n = pcall(function() return nameObj:ToString() end)
-                if ok3 and n == name then return da end
-            end
+            local ok2, n = pcall(function() return da.Name:ToString() end)
+            if ok2 and n == name then return da end
         end
     end
     return nil
@@ -192,7 +187,7 @@ local function computeSlotCounts(ps, propName, daField)
         if not arr then return end
         arr:ForEach(function(_, elem)
             if elem:get():IsValid() then
-                local ok, da = pcall(function() return elem:get():GetPropertyValue(daField) end)
+                local ok, da = pcall(function() return elem:get()[daField] end)
                 if ok and da then
                     local name = getDAName(da)
                     if name ~= "" then
@@ -632,7 +627,7 @@ local function applyInventory(ps, inv)
                     end
                     local da = findDA(daList, toWrite[writeIdx])
                     if da then
-                        pcall(function() elem:get():SetPropertyValue(daField, da) end)
+                        pcall(function() elem:get()[daField] = da end)
                         writeIdx = writeIdx + 1
                     end
                 end
