@@ -6,7 +6,7 @@
 
 # Room code — all players in the same session must set this to the same value.
 # Use any short identifier, e.g. the host's name.
-roomCode = default
+roomCode = dudie
 
 # --- What to sync (set false to leave that item alone) ---
 syncWeapon      = true
