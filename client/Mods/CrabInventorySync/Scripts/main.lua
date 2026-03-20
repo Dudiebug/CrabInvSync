@@ -1,5 +1,5 @@
--- Uncomment the line below to enable debug keybinds (F6/F7/F8). Remove when done.
--- require("debug")
+-- Uncomment the line below to enable debug keybinds (F6/F7/F8/F10). Remove when done.
+require("debug_helpers")
 -- require("debug_perks")
 
 -- CrabInventorySync - main.lua
@@ -16,8 +16,6 @@
 --      No "host" designation is needed — each client handles itself.
 --
 -- LIMITATIONS:
---   - Mod slot counts are fixed by what each player already has; we can swap items
---     within existing slots but cannot add new slots (UE4 TArray limitation via UE4SS).
 --   - Crystals property name is guessed; adjust crystalsProperty in config.txt if needed.
 --   - PowerShell must be available (built into Windows 10/11 — no extra install needed).
 --
@@ -110,7 +108,8 @@ end
 local function encodeInventory(inv)
     return string.format(
         '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,"health":%.3f,"maxHealth":%.3f,' ..
-        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s}',
+        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s,' ..
+        '"weaponModSlots":%d,"abilityModSlots":%d,"meleeModSlots":%d,"perkSlots":%d,"relicSlots":%d}',
         jsonStr(inv.weapon),
         jsonStr(inv.ability),
         jsonStr(inv.melee),
@@ -121,7 +120,12 @@ local function encodeInventory(inv)
         jsonStrArray(inv.abilityMods),
         jsonStrArray(inv.meleeMods),
         jsonStrArray(inv.perks),
-        jsonStrArray(inv.relics)
+        jsonStrArray(inv.relics),
+        math.floor(tonumber(inv.weaponModSlots)  or 0),
+        math.floor(tonumber(inv.abilityModSlots) or 0),
+        math.floor(tonumber(inv.meleeModSlots)   or 0),
+        math.floor(tonumber(inv.perkSlots)       or 0),
+        math.floor(tonumber(inv.relicSlots)      or 0)
     )
 end
 
@@ -152,6 +156,11 @@ local function decodeInventory(json)
     inv.meleeMods   = strArray(json, "meleeMods")
     inv.perks       = strArray(json, "perks")
     inv.relics      = strArray(json, "relics")
+    inv.weaponModSlots  = tonumber(json:match('"weaponModSlots"%s*:%s*(%d+)'))  or 0
+    inv.abilityModSlots = tonumber(json:match('"abilityModSlots"%s*:%s*(%d+)')) or 0
+    inv.meleeModSlots   = tonumber(json:match('"meleeModSlots"%s*:%s*(%d+)'))   or 0
+    inv.perkSlots       = tonumber(json:match('"perkSlots"%s*:%s*(%d+)'))       or 0
+    inv.relicSlots      = tonumber(json:match('"relicSlots"%s*:%s*(%d+)'))      or 0
     return inv
 end
 
@@ -176,6 +185,16 @@ local function findDA(daList, name)
         end
     end
     return nil
+end
+
+-- Count total slots (filled or empty) in a TArray property on ps.
+local function countSlots(ps, propName)
+    local n = 0
+    pcall(function()
+        local arr = ps:GetPropertyValue(propName)
+        if arr then arr:ForEach(function() n = n + 1 end) end
+    end)
+    return n
 end
 
 -- Read all mod/perk/relic slots on ps and return a name→count table.
@@ -358,7 +377,8 @@ local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 local function readInventory(ps)
     local inv = {
         weapon = "", ability = "", melee = "", crystals = 0, health = 0, maxHealth = 0,
-        weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {}
+        weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {},
+        weaponModSlots = 0, abilityModSlots = 0, meleeModSlots = 0, perkSlots = 0, relicSlots = 0,
     }
     if not ps then return inv end
     local okv = pcall(function() return ps:IsValid() end)
@@ -488,6 +508,15 @@ local function readInventory(ps)
         end
     end
 
+    -- Slot counts: how many TArray slots this player has unlocked per category.
+    -- Pushed to server so the max across players propagates back and all clients
+    -- call ServerIncrementNumInventorySlots to match before writing items.
+    inv.weaponModSlots  = countSlots(ps, "WeaponMods")
+    inv.abilityModSlots = countSlots(ps, "AbilityMods")
+    inv.meleeModSlots   = countSlots(ps, "MeleeMods")
+    inv.perkSlots       = countSlots(ps, "Perks")
+    inv.relicSlots      = countSlots(ps, "Relics")
+
     return inv
 end
 
@@ -520,11 +549,11 @@ local function applyInventory(ps, inv)
             local newAbility = (SYNC_ABILITY and inv.ability ~= "") and inv.ability or curAbility
             local newMelee   = (SYNC_MELEE   and inv.melee   ~= "") and inv.melee   or curMelee
             -- Log recv vs game vs debounce-stable on every apply evaluation.
-            print(string.format(
-                "[CrabSync:apply] recv=(%s|%s|%s)  game=(%s|%s|%s)  stable=(%s|%s|%s)\n",
-                inv.weapon or "", inv.ability or "", inv.melee or "",
-                curWeapon, curAbility, curMelee,
-                stableWeapon or "?", stableAbility or "?", stableMelee or "?"))
+            --print(string.format(
+            --    "[CrabSync:apply] recv=(%s|%s|%s)  game=(%s|%s|%s)  stable=(%s|%s|%s)\n",
+            --    inv.weapon or "", inv.ability or "", inv.melee or "",
+            --    curWeapon, curAbility, curMelee,
+            --    stableWeapon or "?", stableAbility or "?", stableMelee or "?"))
             -- If the game's current value differs from the debounce-stable value the
             -- player is mid-pick (debounce window active).  Applying recv here would
             -- revert the just-picked item back to the old server value — block it.
@@ -535,18 +564,18 @@ local function applyInventory(ps, inv)
             if blockedA then newAbility = curAbility end
             if blockedM then newMelee   = curMelee   end
             if blockedW or blockedA or blockedM then
-                print(string.format(
-                    "[CrabSync:apply] BLOCKED debounce: W=%s A=%s M=%s\n",
-                    tostring(blockedW), tostring(blockedA), tostring(blockedM)))
+                --print(string.format(
+                --    "[CrabSync:apply] BLOCKED debounce: W=%s A=%s M=%s\n",
+                --    tostring(blockedW), tostring(blockedA), tostring(blockedM)))
             end
             if newWeapon == curWeapon and newAbility == curAbility and newMelee == curMelee then return end
             local weapon  = findDA(weaponDAs,  newWeapon)  or ps.WeaponDA
             local ability = findDA(abilityDAs, newAbility) or ps.AbilityDA
             local melee   = findDA(meleeDAs,   newMelee)   or ps.MeleeDA
             if weapon and ability and melee then
-                print(string.format(
-                    "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
-                    newWeapon, newAbility, newMelee))
+                --print(string.format(
+                --    "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
+                --    newWeapon, newAbility, newMelee))
                 ps:ServerEquipInventory(weapon, ability, melee)
                 appliedWeapon  = newWeapon
                 appliedAbility = newAbility
@@ -633,6 +662,26 @@ local function applyInventory(ps, inv)
                 end
             end)
         end)
+    end
+
+    -- Expand slots to match the merged counts before writing items.
+    -- If a player has 0 perk slots locally but the merged inventory has 3 perks,
+    -- calling ServerIncrementNumInventorySlots creates the missing slots so
+    -- applySlotArray can overwrite them on this tick (listen-server) or the next.
+    -- ECrabPickupType: WeaponMod=4, AbilityMod=5, MeleeMod=6, Perk=7, Relic=8
+    for _, se in ipairs({
+        { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  pickupType=4, needed=inv.weaponModSlots  or 0 },
+        { flag=SYNC_ABILITY_MODS, prop="AbilityMods", pickupType=5, needed=inv.abilityModSlots or 0 },
+        { flag=SYNC_MELEE_MODS,   prop="MeleeMods",   pickupType=6, needed=inv.meleeModSlots   or 0 },
+        { flag=SYNC_PERKS,        prop="Perks",       pickupType=7, needed=inv.perkSlots       or 0 },
+        { flag=SYNC_RELICS,       prop="Relics",      pickupType=8, needed=inv.relicSlots      or 0 },
+    }) do
+        if se.flag and se.needed > 0 then
+            local current = countSlots(ps, se.prop)
+            for _ = current + 1, se.needed do
+                pcall(function() ps:ServerIncrementNumInventorySlots(se.pickupType, 0) end)
+            end
+        end
     end
 
     -- Apply each category then immediately anchor the delta-tracker so the next
@@ -790,10 +839,10 @@ local function pushIfChanged()
 
     local invJson = encodeInventory(readInventory(ps))
     -- Always log the push evaluation so we can see debounce-stable vs last-pushed.
-    print(string.format(
-        "[CrabSync:push] eval stable=(%s|%s|%s) changed=%s\n",
-        stableWeapon or "?", stableAbility or "?", stableMelee or "?",
-        tostring(invJson ~= lastPushedJson)))
+    --print(string.format(
+    --    "[CrabSync:push] eval stable=(%s|%s|%s) changed=%s\n",
+    --    stableWeapon or "?", stableAbility or "?", stableMelee or "?",
+    --    tostring(invJson ~= lastPushedJson)))
     if invJson == lastPushedJson then return end
 
     -- Wrap inventory with room so the bridge doesn't need it hardcoded.
@@ -815,7 +864,7 @@ local function applyIfChanged()
     -- Skip apply for one tick after we pushed — lets the bridge process push.json
     -- and update recv.json so we don't immediately apply a stale recv that reverts
     -- whatever the player just picked up (weapon, mod, ability, melee).
-    if skipNextApply then skipNextApply = false; print("[CrabSync] apply SKIPPED (post-push tick — letting bridge update recv)\n"); return end
+    if skipNextApply then skipNextApply = false; --[[print("[CrabSync] apply SKIPPED (post-push tick — letting bridge update recv)\n")]] return end
     local f = io.open(RECV_FILE, "r")
     if not f then return end
     local json = f:read("*a")
@@ -827,7 +876,7 @@ local function applyIfChanged()
     local ps = getLocalPS()
     if not ps then return end
     applyInventory(ps, inv)
-    print("[CrabInventorySync] Applied merged inventory to local player.\n")
+    --print("[CrabInventorySync] Applied merged inventory to local player.\n")
 end
 
 local function pollTick()
