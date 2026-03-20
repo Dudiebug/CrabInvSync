@@ -1,6 +1,6 @@
 {
   "name": "crab-inventory-sync-server",
-  "version": "3.0.0",
+  "version": "0.0.1",
   "description": "REST relay server for CrabInventorySync",
   "main": "server.js",
   "scripts": {
