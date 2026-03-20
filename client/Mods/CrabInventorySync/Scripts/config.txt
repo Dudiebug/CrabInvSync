@@ -4,9 +4,8 @@
 # Relay server URL. Only change this if you are self-hosting the server.
 # serverUrl = https://crab.dudiebug.net
 
-# Fallback room code used only if the session host cannot be auto-detected
-# (e.g. solo play, main menu). In a multiplayer session the room is set
-# automatically from the host's name — no manual coordination needed.
+# Room code — all players in the same session must set this to the same value.
+# Use any short identifier, e.g. the host's name.
 roomCode = default
 
 # --- What to sync (set false to leave that item alone) ---

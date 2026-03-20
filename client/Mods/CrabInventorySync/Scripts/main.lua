@@ -791,7 +791,6 @@ local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
 local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
 local lastRecvJson    = ""     -- JSON we last applied from recv.json
 local isTransitioning = false  -- pauses polling during level transitions
-local currentRoomCode = nil    -- detected from GameState.PlayerArray[0]; nil = not yet detected
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
 
@@ -819,23 +818,13 @@ local lastGameHealth = nil   -- raw game HP at the last read or apply
 -- Write push.json only when the inventory has actually changed.
 -- The file is written as {"room":"...","inventory":{...}} so the bridge can
 -- automatically use the correct room for both push POSTs and sync GETs without
--- any manual config — the room is derived from GameState.PlayerArray[0] (the host).
+-- any manual config — set roomCode in config.txt to match all players in the session.
 local function pushIfChanged()
     if isTransitioning then return end
     local ps = getLocalPS()
     if not ps then return end
 
-    -- Try GameState-based room detection every tick until it succeeds.
-    -- Once set, stop retrying — avoids any per-tick overhead.
-    -- Reset to nil on level transition so re-detection fires in the new level.
-    if not currentRoomCode then
-        local detected = detectRoomCode()
-        if detected then
-            currentRoomCode = detected
-            print("[CrabInventorySync] Room: " .. currentRoomCode .. "\n")
-        end
-    end
-    local roomForPush = currentRoomCode or ROOM_CODE
+    local roomForPush = ROOM_CODE
 
     local invJson = encodeInventory(readInventory(ps))
     -- Always log the push evaluation so we can see debounce-stable vs last-pushed.
@@ -911,7 +900,6 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
-        currentRoomCode = nil  -- re-detect host from new level's PlayerArray
         -- Reset delta-trackers so the first read in the new level re-initialises
         -- cleanly (avoids a large negative delta from the old applied total vs.
         -- the new level's starting values).
@@ -934,7 +922,7 @@ end)
 RegisterKeyBind(Key.F9, function()
     lastPushedJson   = ""
     lastRecvJson     = ""
-    currentRoomCode  = nil   -- re-detect host on next push tick
+
     ownCrystals      = nil   -- re-initialise delta-trackers on next read
     lastGameCrystals = nil
     ownHealth        = nil
