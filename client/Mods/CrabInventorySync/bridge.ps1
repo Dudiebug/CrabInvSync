@@ -1,13 +1,18 @@
 <#
-  CrabInventorySync v0.0.1 — PowerShell HTTP Bridge
+  CrabInventorySync Bridge — PowerShell HTTP client
   No external dependencies. Requires PowerShell 5+ (built into Windows 10/11).
 
   Usage (auto-launched by main.lua — do not run manually):
-    powershell -File bridge.ps1 <serverUrl> <playerName>
+    powershell -File bridge.ps1 <serverUrl> <roomCode> <playerName> <password>
 
-  IPC files (inside Scripts/ subdirectory):
-    push.json  — Lua writes { peers: [...], inventory: {...} }  → bridge POSTs to /push
-    recv.json  — bridge writes merged inventory                 ← server response / poll
+  Two files talk to the UE4SS Lua mod inside the game:
+    Scripts\push.json  — Lua writes {"room":"...","inventory":{...}}  → bridge POSTs to server
+    Scripts\recv.json  — bridge writes merged inventory               ← server response / poll
+
+  Room code is auto-detected by Lua from GameState.PlayerArray[0] (the session host) and
+  embedded in push.json.  The bridge reads it from there so all players in the same Steam
+  session share the same room automatically.  $RoomCode is used only as an initial fallback
+  until the first push.json arrives.
 #>
 param(
     [string]$ServerUrl  = 'https://crab.dudiebug.net',
@@ -17,129 +22,144 @@ param(
 $ScriptsDir  = Join-Path $PSScriptRoot 'Scripts'
 $PushFile    = Join-Path $ScriptsDir   'push.json'
 $RecvFile    = Join-Path $ScriptsDir   'recv.json'
-$LogFile     = Join-Path $ScriptsDir   'bridge.log'
+$LogFilePath = Join-Path $ScriptsDir   'bridge.log'
 
 $lastPushMtime = [datetime]::MinValue
 $lastRecvJson  = ''
-$tick          = 0
+$currentRoom   = 'default'   # updated from push.json as soon as Lua detects the host
 
-function Ts   { [datetime]::Now.ToString('HH:mm:ss.fff') }
-function Log  { param($m) Write-Host "[$( Ts )] $m" }
-function LogE { param($m) Write-Host "[$( Ts )] ERROR $m" -ForegroundColor Red }
-function LogF {
+function Ts      { [datetime]::Now.ToString('HH:mm:ss.fff') }
+function Log     { param($m) Write-Host "[$( Ts )] $m" }
+function LogE    { param($m) Write-Host "[$( Ts )] ERROR $m" -ForegroundColor Red }
+function LogFile {
     param($m)
-    try { [IO.File]::AppendAllText($LogFile, "[$( Ts )] $m`r`n", (New-Object Text.UTF8Encoding $false)) } catch {}
+    try {
+        [System.IO.File]::AppendAllText($LogFilePath, "[$( Ts )] $m`r`n", (New-Object System.Text.UTF8Encoding $False))
+    } catch {}
 }
 
+LogFile "=== Bridge started ===  Server=$ServerUrl  Player=$PlayerName"
+Log '=== CrabInventorySync Bridge (PowerShell) ==='
+Log "Server  : $ServerUrl"
+Log "Room    : (auto-detected from session host)"
+Log "Player  : $PlayerName"
+Log "Push    : $PushFile"
+Log "Recv    : $RecvFile"
+Log '============================================='
+Log 'Leave this window open while playing.'
+Log ''
+
+# Write recv.json only when content actually changed.
 function WriteRecv {
     param([string]$json, [string]$source)
     if ($json -eq $script:lastRecvJson) { return }
     $script:lastRecvJson = $json
     try {
-        [IO.File]::WriteAllText($RecvFile, $json, (New-Object Text.UTF8Encoding $false))
-        Log "recv ($source) updated"
+        [System.IO.File]::WriteAllText($RecvFile, $json, (New-Object System.Text.UTF8Encoding $False))
+        $inv = $json | ConvertFrom-Json
+        Log "Recv ($source) | weapon=$($inv.weapon) perks=$($inv.perks.Count)"
     } catch {
-        LogE "recv write failed: $_"
+        LogE "Failed to write recv.json: $_"
     }
 }
 
-LogF "=== Bridge started === Server=$ServerUrl Player=$PlayerName"
-Log  '=== CrabInventorySync v0.0.1 Bridge ==='
-Log  "Server : $ServerUrl"
-Log  "Player : $PlayerName"
-Log  "Push   : $PushFile"
-Log  "Recv   : $RecvFile"
-Log  '========================================='
-Log  'Leave this window open while playing.'
-Log  ''
+$gameProcess = 'CrabChampions-Win64-Shipping'
+Log "Watching for game process: $gameProcess.exe"
+Log 'Starting sync loop...'
 
-$gameProc = 'CrabChampions-Win64-Shipping'
-Log "Watching for game process: $gameProc.exe"
+$tickCount = 0
 
 while ($true) {
-    $tick++
 
-    # ---- Exit if game closed (every 2 s = 4 ticks) ----
-    if ($tick % 4 -eq 0) {
-        if (-not (Get-Process -Name $gameProc -ErrorAction SilentlyContinue)) {
-            Log 'Game closed — sending leave and exiting.'
+    # ---- Exit if the game has closed (checked every 1 s) ----
+    $tickCount++
+    if ($tickCount % 2 -eq 0) {
+        if (-not (Get-Process -Name $gameProcess -ErrorAction SilentlyContinue)) {
+            Log 'Game process not found — sending leave and shutting down.'
             try {
-                $body = (@{ player = $PlayerName } | ConvertTo-Json -Compress)
-                Invoke-RestMethod -Uri "$ServerUrl/leave" -Method POST -Body $body -ContentType 'application/json' -ErrorAction SilentlyContinue | Out-Null
-                LogF "LEAVE player=$PlayerName"
+                $leaveBody = (@{ room = $currentRoom; player = $PlayerName; password = '4982904' } | ConvertTo-Json -Compress)
+                Invoke-RestMethod -Uri "$ServerUrl/leave" -Method POST -Body $leaveBody -ContentType 'application/json' -ErrorAction SilentlyContinue | Out-Null
+                LogFile "LEAVE room=$currentRoom player=$PlayerName"
             } catch {}
             Start-Sleep -Seconds 1
             exit 0
         }
     }
 
-    # ---- Push if push.json changed ----
+    # ---- Push push.json if it changed since last read ----
     if (Test-Path $PushFile) {
         try {
             $info = Get-Item $PushFile -ErrorAction Stop
             if ($info.LastWriteTime -gt $script:lastPushMtime -and $info.Length -gt 0) {
                 $script:lastPushMtime = $info.LastWriteTime
-                $raw = [IO.File]::ReadAllText($PushFile, [Text.Encoding]::UTF8)
-                $parsed = $raw | ConvertFrom-Json
+                $invJson  = [System.IO.File]::ReadAllText($PushFile, [System.Text.Encoding]::UTF8)
+                $pushData = $invJson | ConvertFrom-Json
 
-                $peers = @()
-                if ($parsed.PSObject.Properties['inventory']) {
-                    $inv   = $parsed.inventory
-                    $peers = if ($parsed.peers) { $parsed.peers } else { @() }
+                # New format: {"room":"...","inventory":{...}}
+                # Legacy format (bare inventory object) still supported as fallback.
+                if ($pushData.PSObject.Properties['inventory']) {
+                    $inv = $pushData.inventory
+                    if ($pushData.room) {
+                        $currentRoom = $pushData.room
+                        Log "Room updated: $currentRoom"
+                    }
                 } else {
-                    $inv = $parsed
+                    $inv = $pushData
                 }
 
                 $bodyObj = [ordered]@{
+                    room      = $currentRoom
                     player    = $PlayerName
-                    peers     = $peers
+                    password  = '4982904'
+                    players   = if ($pushData.PSObject.Properties['players']) { $pushData.players } else { @($PlayerName) }
                     inventory = $inv
                 }
                 $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 5
-                LogF "PUSH player=$PlayerName peers=$($peers -join ',') body=$bodyJson"
+
+                LogFile "PUSH  room=$currentRoom  player=$PlayerName  body=$bodyJson"
 
                 $resp = Invoke-RestMethod `
-                    -Uri "$ServerUrl/push" `
-                    -Method POST `
-                    -Body $bodyJson `
+                    -Uri         "$ServerUrl/push" `
+                    -Method      POST `
+                    -Body        $bodyJson `
                     -ContentType 'application/json' `
                     -ErrorAction Stop
 
                 if ($resp.inventory) {
                     $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 5
-                    LogF "RESP (push) $merged"
+                    LogFile "RESP  (push) $merged"
                     WriteRecv $merged 'push'
                 }
-                Log "Pushed | W=$($inv.weapon) A=$($inv.ability)"
+                Log "Pushed | weapon=$($inv.weapon) perks=$($inv.perks.Count)"
             }
         } catch {
             LogE "Push failed: $_"
         }
     }
 
-    # ---- Heartbeat (every 10 s = 20 ticks) ----
-    if ($tick % 20 -eq 0) {
-        try {
-            $hb = (@{ player = $PlayerName } | ConvertTo-Json -Compress)
-            Invoke-RestMethod -Uri "$ServerUrl/heartbeat" -Method POST -Body $hb -ContentType 'application/json' -ErrorAction Stop | Out-Null
-        } catch {}
-    }
+    # ---- Heartbeat — fire-and-forget, tells the server we're still alive ----
+    try {
+        $hbBody = (@{ room = $currentRoom; player = $PlayerName; password = '4982904' } | ConvertTo-Json -Compress)
+        Invoke-RestMethod -Uri "$ServerUrl/heartbeat" -Method POST -Body $hbBody -ContentType 'application/json' -ErrorAction Stop | Out-Null
+    } catch {}
 
-    # ---- Fallback poll (every 4 s = 8 ticks) ----
-    if ($tick % 8 -eq 0) {
-        try {
-            $esc  = [Uri]::EscapeDataString($PlayerName)
-            $resp = Invoke-RestMethod -Uri "$ServerUrl/sync/$esc" -Method GET -ErrorAction Stop
-            if ($resp.inventory) {
-                $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 5
-                if ($merged -ne $script:lastRecvJson) {
-                    LogF "RESP (poll) $merged"
-                }
-                WriteRecv $merged 'poll'
+    # ---- Poll server for any new merged inventory ----
+    try {
+        $esc  = [Uri]::EscapeDataString($currentRoom)
+        $resp = Invoke-RestMethod `
+            -Uri         "$ServerUrl/sync/$esc" `
+            -Method      GET `
+            -ErrorAction Stop
+
+        if ($resp.inventory) {
+            $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 5
+            if ($merged -ne $script:lastRecvJson) {
+                LogFile "RESP  (poll) $merged"
             }
-        } catch {
-            LogE "Poll failed: $_"
+            WriteRecv $merged 'poll'
         }
+    } catch {
+        LogE "Poll failed: $_"
     }
 
     Start-Sleep -Milliseconds 500

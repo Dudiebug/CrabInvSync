@@ -1,22 +1,30 @@
-# CrabInventorySync v0.0.1 Configuration
+# CrabInventorySync configuration
 # Lines starting with # are comments.
 
-# Relay server URL. Only change if self-hosting.
+# Relay server URL. Only change this if you are self-hosting the server.
 # serverUrl = https://crab.dudiebug.net
 
-# --- Sync toggles (set false to leave that category alone) ---
+# Fallback room code used only if the session host cannot be auto-detected
+# (e.g. solo play, main menu). In a multiplayer session the room is set
+# automatically from the host's name — no manual coordination needed.
+roomCode = default
+
+# --- What to sync (set false to leave that item alone) ---
 syncWeapon      = true
 syncAbility     = true
 syncMelee       = true
 syncCrystals    = true
-syncHealth      = true
 syncWeaponMods  = true
 syncAbilityMods = true
 syncMeleeMods   = true
 syncPerks       = true
 syncRelics      = true
+syncHealth      = true
 syncSlots       = true
 
-# Internal PlayerState property name for crystals.
-# If crystals always read as 0, use debug.lua (F7) to find the correct name.
+# Internal PlayerState property names. If a value always reads as 0,
+# use debug.lua (F8) to find the correct name in your game version.
+# Crystals alternatives: CrystalCount, GoldCount, Currency
+# Health alternatives:   CurrentHealth, MaxHealth, HP
 crystalsProperty = Crystals
+healthProperty   = Health
