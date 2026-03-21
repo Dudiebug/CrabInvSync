@@ -4,9 +4,10 @@
 # Relay server URL. Only change this if you are self-hosting the server.
 # serverUrl = https://crab.dudiebug.net
 
-# Room code — all players in the same session must set this to the same value.
-# Use any short identifier, e.g. the host's name.
-roomCode = dudie
+# Fallback room code used only if the session host cannot be auto-detected
+# (e.g. solo play, main menu). In a multiplayer session the room is set
+# automatically from the host's name — no manual coordination needed.
+roomCode = default
 
 # --- What to sync (set false to leave that item alone) ---
 syncWeapon      = true
@@ -19,6 +20,7 @@ syncMeleeMods   = true
 syncPerks       = true
 syncRelics      = true
 syncHealth      = true
+syncSlots       = true
 
 # Internal PlayerState property names. If a value always reads as 0,
 # use debug.lua (F8) to find the correct name in your game version.

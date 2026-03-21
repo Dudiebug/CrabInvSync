@@ -1,9 +1,6 @@
 {
   "name": "crab-inventory-sync-bridge",
-  "version": "3.1.0",
-  "description": "HTTP bridge for CrabInventorySync — no npm dependencies",
-  "main": "bridge.js",
-  "scripts": {
-    "start": "node bridge.js https://crab.dudiebug.net myroom"
-  }
+  "version": "0.0.2",
+  "description": "CrabInventorySync client mod (UE4SS Lua + PowerShell bridge)",
+  "main": "bridge.ps1"
 }

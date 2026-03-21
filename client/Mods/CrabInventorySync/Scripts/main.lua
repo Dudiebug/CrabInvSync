@@ -1,6 +1,7 @@
--- Uncomment the line below to enable debug keybinds (F6/F7/F8/F10). Remove when done.
--- require("debug_helpers")
+-- Uncomment the line below to enable debug keybinds (F6/F7/F8). Remove when done.
+-- require("debug")
 -- require("debug_perks")
+-- require("perk_tastyorange_mod")
 
 -- CrabInventorySync - main.lua
 -- Syncs inventory between all players in a multiplayer session via a PowerShell bridge.
@@ -39,8 +40,11 @@ local SYNC_MELEE_MODS    = true
 local SYNC_PERKS         = true
 local SYNC_RELICS        = true
 local SYNC_HEALTH        = true
+local SYNC_SLOTS         = true
 -- Internal property name for crystals on CrabPS (adjust if values read as 0)
 local CRYSTALS_PROPERTY  = "Crystals"
+-- Shared secret sent with every push to keep the server endpoint private.
+local ROOM_PASSWORD      = "4982904"
 
 local SCRIPT_DIR_PRIMARY   = "Mods/CrabInventorySync/Scripts/"
 local SCRIPT_DIR_SECONDARY = "ue4ss/Mods/CrabInventorySync/Scripts/"
@@ -85,7 +89,9 @@ local function loadConfig()
             elseif key == "syncPerks"        then SYNC_PERKS           = (value == "true")
             elseif key == "syncRelics"       then SYNC_RELICS          = (value == "true")
             elseif key == "syncHealth"       then SYNC_HEALTH          = (value == "true")
+            elseif key == "syncSlots"        then SYNC_SLOTS           = (value == "true")
             elseif key == "crystalsProperty" then CRYSTALS_PROPERTY    = value
+            elseif key == "roomPassword"     then ROOM_PASSWORD        = value
             end
         end
     end
@@ -108,9 +114,11 @@ local function jsonStrArray(arr)
 end
 
 local function encodeInventory(inv)
+    local sl = inv.slots or { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     return string.format(
         '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,"health":%.3f,"maxHealth":%.3f,' ..
-        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s}',
+        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s,' ..
+        '"slots":{"weaponMods":%d,"abilityMods":%d,"meleeMods":%d,"perks":%d}}',
         jsonStr(inv.weapon),
         jsonStr(inv.ability),
         jsonStr(inv.melee),
@@ -121,7 +129,11 @@ local function encodeInventory(inv)
         jsonStrArray(inv.abilityMods),
         jsonStrArray(inv.meleeMods),
         jsonStrArray(inv.perks),
-        jsonStrArray(inv.relics)
+        jsonStrArray(inv.relics),
+        math.floor(tonumber(sl.weaponMods) or 0),
+        math.floor(tonumber(sl.abilityMods) or 0),
+        math.floor(tonumber(sl.meleeMods) or 0),
+        math.floor(tonumber(sl.perks) or 0)
     )
 end
 
@@ -152,6 +164,15 @@ local function decodeInventory(json)
     inv.meleeMods   = strArray(json, "meleeMods")
     inv.perks       = strArray(json, "perks")
     inv.relics      = strArray(json, "relics")
+
+    -- Parse slots sub-object: "slots":{"weaponMods":N,"abilityMods":N,"meleeMods":N,"perks":N}
+    local slotsBlock = json:match('"slots"%s*:%s*(%b{})')
+    inv.slots = {
+        weaponMods  = tonumber(slotsBlock and slotsBlock:match('"weaponMods"%s*:%s*(%d+)'))  or 0,
+        abilityMods = tonumber(slotsBlock and slotsBlock:match('"abilityMods"%s*:%s*(%d+)')) or 0,
+        meleeMods   = tonumber(slotsBlock and slotsBlock:match('"meleeMods"%s*:%s*(%d+)'))   or 0,
+        perks       = tonumber(slotsBlock and slotsBlock:match('"perks"%s*:%s*(%d+)'))       or 0,
+    }
     return inv
 end
 
@@ -236,6 +257,34 @@ local function detectRoomCode()
     -- Sanitize: lowercase, collapse anything that isn't alphanumeric/dash to
     -- underscores, cap at 32 chars so room codes stay readable in server logs.
     return hostName:gsub("[^%w%-]", "_"):lower():sub(1, 32)
+end
+
+-- Returns a flat array of all player name strings currently in GameState.PlayerArray.
+-- Used to tell the server who belongs in this room's merge.
+local function getSessionPlayers()
+    local names = {}
+    local gs = FindFirstOf("CrabGS")
+    if not gs then
+        local ok, v = pcall(FindFirstOf, "GameStateBase")
+        if ok and v then gs = v end
+    end
+    if not gs then return names end
+    local okv = pcall(function() return gs:IsValid() end)
+    if not okv then return names end
+    pcall(function()
+        local arr = gs:GetPropertyValue("PlayerArray")
+        if not arr then return end
+        arr:ForEach(function(_, elem)
+            local ok, v = pcall(function() return elem:get():IsValid() end)
+            if ok and v then
+                local n = getPlayerName(elem:get())
+                if n and n ~= "" and n ~= "UnknownPlayer" then
+                    table.insert(names, n)
+                end
+            end
+        end)
+    end)
+    return names
 end
 
 -- ============================================================
@@ -358,7 +407,8 @@ local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 local function readInventory(ps)
     local inv = {
         weapon = "", ability = "", melee = "", crystals = 0, health = 0, maxHealth = 0,
-        weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {}
+        weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {},
+        slots = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     }
     if not ps then return inv end
     local okv = pcall(function() return ps:IsValid() end)
@@ -370,7 +420,7 @@ local function readInventory(ps)
     -- On first read the initial value is accepted immediately (no delay).
     if SYNC_WEAPON then
         local cur = ""
-        pcall(function() cur = getDAName(ps:GetPropertyValue("WeaponDA")) end)
+        pcall(function() cur = getDAName(ps.WeaponDA) end)
         if cur ~= pendingWeapon then
             pendingWeapon = cur;  pendingWCount = 1
             if stableWeapon == nil then stableWeapon = cur end   -- accept initial value immediately
@@ -382,7 +432,7 @@ local function readInventory(ps)
     end
     if SYNC_ABILITY then
         local cur = ""
-        pcall(function() cur = getDAName(ps:GetPropertyValue("AbilityDA")) end)
+        pcall(function() cur = getDAName(ps.AbilityDA) end)
         if cur ~= pendingAbility then
             pendingAbility = cur;  pendingACount = 1
             if stableAbility == nil then stableAbility = cur end
@@ -394,7 +444,7 @@ local function readInventory(ps)
     end
     if SYNC_MELEE then
         local cur = ""
-        pcall(function() cur = getDAName(ps:GetPropertyValue("MeleeDA")) end)
+        pcall(function() cur = getDAName(ps.MeleeDA) end)
         if cur ~= pendingMelee then
             pendingMelee = cur;  pendingMCount = 1
             if stableMelee == nil then stableMelee = cur end
@@ -488,6 +538,13 @@ local function readInventory(ps)
         end
     end
 
+    if SYNC_SLOTS then
+        pcall(function() inv.slots.weaponMods  = math.floor(tonumber(ps:GetPropertyValue("NumWeaponModSlots"))  or 0) end)
+        pcall(function() inv.slots.abilityMods = math.floor(tonumber(ps:GetPropertyValue("NumAbilityModSlots")) or 0) end)
+        pcall(function() inv.slots.meleeMods   = math.floor(tonumber(ps:GetPropertyValue("NumMeleeModSlots"))   or 0) end)
+        pcall(function() inv.slots.perks       = math.floor(tonumber(ps:GetPropertyValue("NumPerkSlots"))       or 0) end)
+    end
+
     return inv
 end
 
@@ -513,18 +570,18 @@ local function applyInventory(ps, inv)
         pcall(function()
             -- Only call ServerEquipInventory if a name actually changed — calling
             -- it unnecessarily resets ammo, fire rate, and other weapon state.
-            local curWeapon  = getDAName(ps:GetPropertyValue("WeaponDA"))
-            local curAbility = getDAName(ps:GetPropertyValue("AbilityDA"))
-            local curMelee   = getDAName(ps:GetPropertyValue("MeleeDA"))
+            local curWeapon  = getDAName(ps.WeaponDA)
+            local curAbility = getDAName(ps.AbilityDA)
+            local curMelee   = getDAName(ps.MeleeDA)
             local newWeapon  = (SYNC_WEAPON  and inv.weapon  ~= "") and inv.weapon  or curWeapon
             local newAbility = (SYNC_ABILITY and inv.ability ~= "") and inv.ability or curAbility
             local newMelee   = (SYNC_MELEE   and inv.melee   ~= "") and inv.melee   or curMelee
             -- Log recv vs game vs debounce-stable on every apply evaluation.
-            --print(string.format(
-            --    "[CrabSync:apply] recv=(%s|%s|%s)  game=(%s|%s|%s)  stable=(%s|%s|%s)\n",
-            --    inv.weapon or "", inv.ability or "", inv.melee or "",
-            --    curWeapon, curAbility, curMelee,
-            --    stableWeapon or "?", stableAbility or "?", stableMelee or "?"))
+            print(string.format(
+                "[CrabSync:apply] recv=(%s|%s|%s)  game=(%s|%s|%s)  stable=(%s|%s|%s)\n",
+                inv.weapon or "", inv.ability or "", inv.melee or "",
+                curWeapon, curAbility, curMelee,
+                stableWeapon or "?", stableAbility or "?", stableMelee or "?"))
             -- If the game's current value differs from the debounce-stable value the
             -- player is mid-pick (debounce window active).  Applying recv here would
             -- revert the just-picked item back to the old server value — block it.
@@ -535,18 +592,18 @@ local function applyInventory(ps, inv)
             if blockedA then newAbility = curAbility end
             if blockedM then newMelee   = curMelee   end
             if blockedW or blockedA or blockedM then
-                --print(string.format(
-                --    "[CrabSync:apply] BLOCKED debounce: W=%s A=%s M=%s\n",
-                --    tostring(blockedW), tostring(blockedA), tostring(blockedM)))
+                print(string.format(
+                    "[CrabSync:apply] BLOCKED debounce: W=%s A=%s M=%s\n",
+                    tostring(blockedW), tostring(blockedA), tostring(blockedM)))
             end
             if newWeapon == curWeapon and newAbility == curAbility and newMelee == curMelee then return end
-            local weapon  = findDA(weaponDAs,  newWeapon)  or ps:GetPropertyValue("WeaponDA")
-            local ability = findDA(abilityDAs, newAbility) or ps:GetPropertyValue("AbilityDA")
-            local melee   = findDA(meleeDAs,   newMelee)   or ps:GetPropertyValue("MeleeDA")
+            local weapon  = findDA(weaponDAs,  newWeapon)  or ps.WeaponDA
+            local ability = findDA(abilityDAs, newAbility) or ps.AbilityDA
+            local melee   = findDA(meleeDAs,   newMelee)   or ps.MeleeDA
             if weapon and ability and melee then
-                --print(string.format(
-                --    "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
-                --    newWeapon, newAbility, newMelee))
+                print(string.format(
+                    "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
+                    newWeapon, newAbility, newMelee))
                 ps:ServerEquipInventory(weapon, ability, melee)
                 appliedWeapon  = newWeapon
                 appliedAbility = newAbility
@@ -590,46 +647,17 @@ local function applyInventory(ps, inv)
         end)
     end
 
-    local function applySlotArray(propName, daField, daList, sourceNames, ownItems)
-        if not daList or #daList == 0 then return end
-
-        -- Compute items that need writing: sourceNames minus what we already own in-slot.
-        -- This prevents overwriting a slot that already has one of our own items with
-        -- someone else's item (e.g. merged list = [RemotePerk, YourPerk] → slot 0 written
-        -- with RemotePerk, clobbering YourPerk).
-        local toWrite = {}
-        local ownRemaining = {}
-        for name, count in pairs(ownItems or {}) do ownRemaining[name] = count end
-        for _, name in ipairs(sourceNames) do
-            if ownRemaining[name] and ownRemaining[name] > 0 then
-                ownRemaining[name] = ownRemaining[name] - 1   -- already in a slot, skip
-            else
-                table.insert(toWrite, name)
-            end
-        end
-        if #toWrite == 0 then return end
-
-        -- Write toWrite items only to slots that don't contain one of our own items.
-        local ownSkip = {}
-        for name, count in pairs(ownItems or {}) do ownSkip[name] = count end
-        local writeIdx = 1
+    local function applySlotArray(propName, daField, daList, sourceNames)
+        if #sourceNames == 0 or not daList or #daList == 0 then return end
         pcall(function()
             local arr = ps:GetPropertyValue(propName)
             if not arr then return end
+            local idx = 1
             arr:ForEach(function(_, elem)
-                if writeIdx > #toWrite then return end
-                if elem:get():IsValid() then
-                    local ok, curDA = pcall(function() return elem:get():GetPropertyValue(daField) end)
-                    local curName = (ok and curDA) and getDAName(curDA) or ""
-                    if ownSkip[curName] and ownSkip[curName] > 0 then
-                        ownSkip[curName] = ownSkip[curName] - 1
-                        return   -- preserve our own item in this slot
-                    end
-                    local da = findDA(daList, toWrite[writeIdx])
-                    if da then
-                        pcall(function() elem:get()[daField] = da end)
-                        writeIdx = writeIdx + 1
-                    end
+                if elem:get():IsValid() and sourceNames[idx] then
+                    local da = findDA(daList, sourceNames[idx])
+                    if da then pcall(function() elem:get()[daField] = da end) end
+                    idx = idx + 1
                 end
             end)
         end)
@@ -647,7 +675,7 @@ local function applyInventory(ps, inv)
         { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      list=relicDAs,      src=inv.relics,      key="relics"      },
     }) do
         if entry.flag then
-            applySlotArray(entry.prop, entry.da, entry.list, entry.src, ownModCounts[entry.key])
+            applySlotArray(entry.prop, entry.da, entry.list, entry.src)
             -- Anchor to what we INTENDED to write, not computeSlotCounts.
             -- Reading the slot immediately after writing via UE4SS reflection returns
             -- the pre-write value for that tick (the game hasn't processed it yet).
@@ -659,6 +687,27 @@ local function applyInventory(ps, inv)
                 writtenCounts[name] = (writtenCounts[name] or 0) + 1
             end
             lastGameModCounts[entry.key] = writtenCounts
+        end
+    end
+
+    -- Apply slot counts from the merged payload.  Only increase — never decrease.
+    -- Uses SetPropertyValue (reflection write) only; no UFunction calls.
+    if SYNC_SLOTS and inv.slots then
+        for _, entry in ipairs({
+            { prop="NumWeaponModSlots",  key="weaponMods"  },
+            { prop="NumAbilityModSlots", key="abilityMods" },
+            { prop="NumMeleeModSlots",   key="meleeMods"   },
+            { prop="NumPerkSlots",       key="perks"       },
+        }) do
+            local incoming = math.floor(tonumber(inv.slots[entry.key]) or 0)
+            if incoming > 0 then
+                pcall(function()
+                    local current = math.floor(tonumber(ps:GetPropertyValue(entry.prop)) or 0)
+                    if incoming > current then
+                        ps:SetPropertyValue(entry.prop, incoming)
+                    end
+                end)
+            end
         end
     end
 end
@@ -742,6 +791,7 @@ local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
 local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
 local lastRecvJson    = ""     -- JSON we last applied from recv.json
 local isTransitioning = false  -- pauses polling during level transitions
+local currentRoomCode = nil    -- detected from GameState.PlayerArray[0]; nil = not yet detected
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
 
@@ -769,24 +819,36 @@ local lastGameHealth = nil   -- raw game HP at the last read or apply
 -- Write push.json only when the inventory has actually changed.
 -- The file is written as {"room":"...","inventory":{...}} so the bridge can
 -- automatically use the correct room for both push POSTs and sync GETs without
--- any manual config — set roomCode in config.txt to match all players in the session.
+-- any manual config — the room is derived from GameState.PlayerArray[0] (the host).
 local function pushIfChanged()
     if isTransitioning then return end
     local ps = getLocalPS()
     if not ps then return end
 
-    local roomForPush = ROOM_CODE
+    -- Try GameState-based room detection every tick until it succeeds.
+    -- Once set, stop retrying — avoids any per-tick overhead.
+    -- Reset to nil on level transition so re-detection fires in the new level.
+    if not currentRoomCode then
+        local detected = detectRoomCode()
+        if detected then
+            currentRoomCode = detected
+            print("[CrabInventorySync] Room: " .. currentRoomCode .. "\n")
+        end
+    end
+    local roomForPush = currentRoomCode or ROOM_CODE
 
     local invJson = encodeInventory(readInventory(ps))
     -- Always log the push evaluation so we can see debounce-stable vs last-pushed.
-    --print(string.format(
-    --    "[CrabSync:push] eval stable=(%s|%s|%s) changed=%s\n",
-    --    stableWeapon or "?", stableAbility or "?", stableMelee or "?",
-    --    tostring(invJson ~= lastPushedJson)))
+    print(string.format(
+        "[CrabSync:push] eval stable=(%s|%s|%s) changed=%s\n",
+        stableWeapon or "?", stableAbility or "?", stableMelee or "?",
+        tostring(invJson ~= lastPushedJson)))
     if invJson == lastPushedJson then return end
 
-    -- Wrap inventory with room so the bridge doesn't need it hardcoded.
-    local payload = '{"room":' .. jsonStr(roomForPush) .. ',"inventory":' .. invJson .. '}'
+    -- Wrap inventory with room, session player list, and password.
+    local sessionPlayers = getSessionPlayers()
+    local playersJson    = jsonStrArray(sessionPlayers)
+    local payload = '{"room":' .. jsonStr(roomForPush) .. ',"players":' .. playersJson .. ',"password":' .. jsonStr(ROOM_PASSWORD) .. ',"inventory":' .. invJson .. '}'
     local f = io.open(PUSH_FILE, "w")
     if f then
         f:write(payload)
@@ -804,7 +866,7 @@ local function applyIfChanged()
     -- Skip apply for one tick after we pushed — lets the bridge process push.json
     -- and update recv.json so we don't immediately apply a stale recv that reverts
     -- whatever the player just picked up (weapon, mod, ability, melee).
-    if skipNextApply then skipNextApply = false; --[[print("[CrabSync] apply SKIPPED (post-push tick — letting bridge update recv)\n")]] return end
+    if skipNextApply then skipNextApply = false; print("[CrabSync] apply SKIPPED (post-push tick — letting bridge update recv)\n"); return end
     local f = io.open(RECV_FILE, "r")
     if not f then return end
     local json = f:read("*a")
@@ -816,7 +878,7 @@ local function applyIfChanged()
     local ps = getLocalPS()
     if not ps then return end
     applyInventory(ps, inv)
-    --print("[CrabInventorySync] Applied merged inventory to local player.\n")
+    print("[CrabInventorySync] Applied merged inventory to local player.\n")
 end
 
 local function pollTick()
@@ -851,6 +913,7 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
+        currentRoomCode = nil  -- re-detect host from new level's PlayerArray
         -- Reset delta-trackers so the first read in the new level re-initialises
         -- cleanly (avoids a large negative delta from the old applied total vs.
         -- the new level's starting values).
@@ -873,7 +936,7 @@ end)
 RegisterKeyBind(Key.F9, function()
     lastPushedJson   = ""
     lastRecvJson     = ""
-
+    currentRoomCode  = nil   -- re-detect host on next push tick
     ownCrystals      = nil   -- re-initialise delta-trackers on next read
     lastGameCrystals = nil
     ownHealth        = nil

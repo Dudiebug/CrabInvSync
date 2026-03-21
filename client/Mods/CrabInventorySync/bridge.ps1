@@ -77,7 +77,7 @@ while ($true) {
         if (-not (Get-Process -Name $gameProcess -ErrorAction SilentlyContinue)) {
             Log 'Game process not found — sending leave and shutting down.'
             try {
-                $leaveBody = (@{ room = $currentRoom; player = $PlayerName } | ConvertTo-Json -Compress)
+                $leaveBody = (@{ room = $currentRoom; player = $PlayerName; password = '4982904' } | ConvertTo-Json -Compress)
                 Invoke-RestMethod -Uri "$ServerUrl/leave" -Method POST -Body $leaveBody -ContentType 'application/json' -ErrorAction SilentlyContinue | Out-Null
                 LogFile "LEAVE room=$currentRoom player=$PlayerName"
             } catch {}
@@ -110,6 +110,8 @@ while ($true) {
                 $bodyObj = [ordered]@{
                     room      = $currentRoom
                     player    = $PlayerName
+                    password  = '4982904'
+                    players   = if ($pushData.PSObject.Properties['players']) { $pushData.players } else { @($PlayerName) }
                     inventory = $inv
                 }
                 $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 5
@@ -137,7 +139,7 @@ while ($true) {
 
     # ---- Heartbeat — fire-and-forget, tells the server we're still alive ----
     try {
-        $hbBody = (@{ room = $currentRoom; player = $PlayerName } | ConvertTo-Json -Compress)
+        $hbBody = (@{ room = $currentRoom; player = $PlayerName; password = '4982904' } | ConvertTo-Json -Compress)
         Invoke-RestMethod -Uri "$ServerUrl/heartbeat" -Method POST -Body $hbBody -ContentType 'application/json' -ErrorAction Stop | Out-Null
     } catch {}
 
