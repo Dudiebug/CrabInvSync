@@ -708,9 +708,15 @@ local function applyInventory(ps, inv)
             local UINT32_MAX = 4294967295
             local total   = math.min(math.floor(inv.crystals), UINT32_MAX)
             local current = math.min(math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0), UINT32_MAX)
-            if current == 0 or total > current then
+            -- Always write the merged total, even if it is lower than the current value.
+            -- The delta-tracker in readInventory already anchors lastGameCrystals to
+            -- whatever we write here, so the very next tick sees delta = 0 and does NOT
+            -- re-add the synced total to ownCrystals.  Without this, crystals spent by
+            -- another player (or crystals that drop after a player disconnects) would
+            -- never propagate — the "only increase" guard silently blocks the write.
+            if total ~= current then
                 ps:SetPropertyValue(CRYSTALS_PROPERTY, total)
-                lastGameCrystals = total   -- keep delta-tracker in sync with what we wrote
+                lastGameCrystals = total   -- anchor: next read delta = 0
                 pcall(function() ps:OnRep_Crystals() end)
             end
         end)
@@ -735,7 +741,11 @@ local function applyInventory(ps, inv)
             if mergedMax > 0 then
                 local currentMax = 0
                 pcall(function() currentMax = math.floor(tonumber(hi.CurrentMaxHealth) or 0) end)
-                if mergedMax > currentMax then
+                -- Always write the merged total (not just when increasing).
+                -- If a player leaves or dies their maxHealth contribution drops, and that
+                -- reduction must propagate to all remaining players.  The anchor below
+                -- prevents the read → delta → push → recv → apply feedback loop.
+                if mergedMax ~= currentMax then
                     hi.CurrentMaxHealth = mergedMax
                     lastGameMaxHealth   = mergedMax  -- anchor: next read delta = 0
                     didWrite = true
@@ -745,11 +755,13 @@ local function applyInventory(ps, inv)
             -- Apply pooled current HP.
             -- We do NOT clamp to maxHP — the design is to pool both totals together,
             -- so 2 × 250 HP players should each see 500/500, not 250/500.
+            -- Always write the merged total so damage taken by any player reduces
+            -- everyone's displayed HP — "4 as 1, one takes damage all feel it".
             local mergedHP = math.floor(tonumber(inv.health) or 0)
             if mergedHP > 0 then
                 local currentHP = 0
                 pcall(function() currentHP = math.floor(tonumber(hi.CurrentHealth) or 0) end)
-                if mergedHP > currentHP then
+                if mergedHP ~= currentHP then
                     hi.CurrentHealth = mergedHP
                     lastGameHealth   = mergedHP  -- anchor: next read delta = 0
                     didWrite = true

@@ -9,10 +9,17 @@
  * GET  /health — liveness check.
  *
  * Merge strategy:
- *   weapon / ability / melee  — from the most recently updated player
+ *   weapon / ability / melee  — per-field: from whoever changed THAT field most recently
+ *                               (per-field timestamps, not just newest overall pusher)
  *   crystals                  — sum of all players' OWN contribution (delta-tracked)
- *   health                    — sum of all players' OWN contribution (delta-tracked)
+ *   health / maxHealth        — sum of all players' OWN contribution (delta-tracked)
  *   weaponMods/abilityMods/meleeMods/perks/relics — MAX count per item name across players
+ *
+ * Disconnect handling:
+ *   On /leave or timeout, players are "ghosted": their crystals/slots/items stay in
+ *   the pool (frozen), but their health contribution is zeroed (they died/left).
+ *   Ghosts are excluded from weapon/ability/melee selection.
+ *   Ghosts are fully removed 5 minutes after leaving, or when the room empties.
  *
  * Run: node server.js [port]   (default: 3000)
  */
@@ -117,18 +124,39 @@ function srvLog(cat, msg, data) {
 
 // Remove stale players every 15s, empty rooms
 setInterval(() => {
-    const cutoff = Date.now() - 60_000;
+    const cutoff    = Date.now() - 60_000;   // ghost after 60 s of silence
+    const ghostCutoff = Date.now() - 5 * 60_000;  // fully remove ghost after 5 min
     for (const [code, room] of Object.entries(rooms)) {
         for (const [name, data] of Object.entries(room)) {
             if (name === '__members') continue;
+            if (data.ghost) {
+                // Fully remove ghosts that have been sitting for > 5 min.
+                if ((data.leftAt || 0) < ghostCutoff) {
+                    srvLog('CLEANUP', `Removed expired ghost "${name}"`, { room: code });
+                    delete room[name];
+                }
+                continue;
+            }
             if ((data.lastSeen || data.updatedAt) < cutoff) {
-                srvLog('CLEANUP', `Pruned inactive player "${name}"`, { room: code });
-                delete room[name];
+                // Timeout: ghost the player (same as a graceful /leave) rather than hard-
+                // deleting, so their crystal / slot contribution is not instantly erased.
+                if (data.inventory) {
+                    data.inventory.health    = 0;
+                    data.inventory.maxHealth = 0;
+                }
+                data.ghost  = true;
+                data.leftAt = Date.now();
+                srvLog('CLEANUP', `Ghosted timed-out player "${name}"`, { room: code });
             }
         }
-        const playerCount = Object.keys(room).filter(k => k !== '__members').length;
-        if (playerCount === 0) {
+        const liveCount = Object.entries(room).filter(([k, v]) => k !== '__members' && !v.ghost).length;
+        const anyEntry  = Object.keys(room).filter(k => k !== '__members').length;
+        if (anyEntry === 0) {
             srvLog('CLEANUP', `Removed empty room`, { room: code });
+            delete rooms[code];
+        } else if (liveCount === 0) {
+            // Only ghosts remain — remove entire room.
+            srvLog('CLEANUP', `Removed all-ghost room`, { room: code });
             delete rooms[code];
         }
     }
@@ -183,20 +211,33 @@ function mergeInventories(room) {
     const members = room.__members;
     const players = Object.entries(room)
         .filter(([name]) => name !== '__members')
-        .filter(([name, p]) => (now - (p.lastSeen || p.updatedAt)) < STALE_MS)
+        // Ghost players (left/disconnected) are always included in the pool — their
+        // contribution is frozen at the moment they left.  Live players must have been
+        // seen within STALE_MS.
+        .filter(([name, p]) => p.ghost || (now - (p.lastSeen || p.updatedAt)) < STALE_MS)
         .filter(([name]) => !members || members.has(name))
         .map(([name, data]) => ({ name, ...data }));
     if (players.length === 0) return null;
 
-    players.sort((a, b) => b.updatedAt - a.updatedAt);
-    const newestEntry = players.find(p => p.inventory);
-    if (!newestEntry) return null;
-    const newest = newestEntry.inventory;
+    // For weapon / ability / melee we pick per-field from whoever changed that field
+    // most recently (not just whoever pushed most recently overall).  This fixes the
+    // race condition where two players push at the same tick but only one changed their
+    // weapon — previously "newest overall" could overwrite the second player's weapon
+    // with stale data from the first player.
+    // Ghost (disconnected) players are excluded from weapon/ability/melee selection
+    // because they are no longer actively playing.
+    const livePlayers = players.filter(p => !p.ghost && p.inventory);
+    const pickField = (field, tsField) => {
+        const candidates = livePlayers.filter(p => p.inventory[field]);
+        if (candidates.length === 0) return '';
+        candidates.sort((a, b) => (b[tsField] || 0) - (a[tsField] || 0));
+        return candidates[0].inventory[field] || '';
+    };
 
     const merged = {
-        weapon:      newest.weapon  || '',
-        ability:     newest.ability || '',
-        melee:       newest.melee   || '',
+        weapon:      pickField('weapon',  'weaponChangedAt'),
+        ability:     pickField('ability', 'abilityChangedAt'),
+        melee:       pickField('melee',   'meleeChangedAt'),
         crystals:    0,
         health:      0,
         maxHealth:   0,
@@ -291,7 +332,16 @@ app.post('/push', (req, res) => {
 
     const r = getRoom(room);
     const now = Date.now();
-    r[player] = { inventory, updatedAt: now, lastSeen: now };
+    // Per-field change timestamps for weapon / ability / melee.
+    // If the player's new value differs from what they last pushed, bump the timestamp
+    // so mergeInventories can pick the most recently changed value per-field across
+    // all players, rather than all-or-nothing from the most recent overall pusher.
+    const prev = r[player];
+    const prevInv = prev && prev.inventory;
+    const weaponChangedAt  = (prevInv && prevInv.weapon  === inventory.weapon)  ? (prev.weaponChangedAt  || now) : now;
+    const abilityChangedAt = (prevInv && prevInv.ability === inventory.ability) ? (prev.abilityChangedAt || now) : now;
+    const meleeChangedAt   = (prevInv && prevInv.melee   === inventory.melee)   ? (prev.meleeChangedAt   || now) : now;
+    r[player] = { inventory, updatedAt: now, lastSeen: now, weaponChangedAt, abilityChangedAt, meleeChangedAt };
 
     if (Array.isArray(players) && players.length > 0) {
         r.__members = new Set(players);
@@ -358,9 +408,29 @@ app.post('/leave', (req, res) => {
     if (!room || !player) return res.status(400).json({ error: 'Missing fields' });
     const r = rooms[room];
     if (r && r[player]) {
-        delete r[player];
-        if (Object.keys(r).filter(k => k !== '__members').length === 0) delete rooms[room];
-        srvLog('LEAVE', `"${player}" left room "${room}"`);
+        // Ghost the player rather than deleting them immediately.  This preserves their
+        // crystals, slots, and item contributions in the pool so the remaining players
+        // don't instantly lose those values.  Health is zeroed — the player died/left,
+        // so their HP should stop contributing to the shared pool.
+        // Ghost entries are excluded from weapon/ability/melee selection (dead players
+        // don't get a vote on which weapon the survivors equip).
+        // The ghost is cleaned up by the normal stale-player sweep once the room
+        // becomes idle, or immediately if the room has no other live players.
+        const entry = r[player];
+        if (entry.inventory) {
+            entry.inventory.health    = 0;
+            entry.inventory.maxHealth = 0;
+        }
+        entry.ghost    = true;
+        entry.leftAt   = Date.now();
+        srvLog('LEAVE', `"${player}" ghosted in room "${room}" — pool contribution frozen`);
+
+        // If no live players remain, remove the room entirely.
+        const liveCount = Object.entries(r).filter(([k, v]) => k !== '__members' && !v.ghost).length;
+        if (liveCount === 0) {
+            delete rooms[room];
+            srvLog('LEAVE', `Room "${room}" removed — no live players`);
+        }
     }
     res.json({ ok: true });
 });
