@@ -9,10 +9,8 @@
     Scripts\push.json  — Lua writes {"room":"...","inventory":{...}}  → bridge POSTs to server
     Scripts\recv.json  — bridge writes merged inventory               ← server response / poll
 
-  Room code is auto-detected by Lua from GameState.PlayerArray[0] (the session host) and
-  embedded in push.json.  The bridge reads it from there so all players in the same Steam
-  session share the same room automatically.  $RoomCode is used only as an initial fallback
-  until the first push.json arrives.
+  Room code is set via roomCode in config.txt and embedded in push.json by Lua.
+  All players who want to sync must use the same roomCode.
 #>
 param(
     [string]$ServerUrl  = 'https://crab.dudiebug.net',
@@ -41,7 +39,7 @@ function LogFile {
 LogFile "=== Bridge started ===  Server=$ServerUrl  Player=$PlayerName"
 Log '=== CrabInventorySync Bridge (PowerShell) ==='
 Log "Server  : $ServerUrl"
-Log "Room    : (auto-detected from session host)"
+Log "Room    : (from config.txt roomCode, embedded in push.json)"
 Log "Player  : $PlayerName"
 Log "Push    : $PushFile"
 Log "Recv    : $RecvFile"
@@ -114,6 +112,9 @@ while ($true) {
                     players   = if ($pushData.PSObject.Properties['players']) { $pushData.players } else { @($PlayerName) }
                     inventory = $inv
                 }
+                # Forward session ID and client logs if present in push.json
+                if ($pushData.PSObject.Properties['session']) { $bodyObj['session'] = $pushData.session }
+                if ($pushData.PSObject.Properties['logs'])    { $bodyObj['logs']    = $pushData.logs }
                 $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 5
 
                 LogFile "PUSH  room=$currentRoom  player=$PlayerName  body=$bodyJson"

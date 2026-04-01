@@ -1,53 +1,177 @@
 /**
  * CrabInventorySync REST Server
  *
- * POST /push  — player sends inventory, receives merged result immediately.
+ * POST /push  — player sends inventory + logs, receives merged result immediately.
  * GET  /sync/:room — poll for latest merged inventory (other players' changes).
+ * GET  /logs/:room — all player logs for a room, organised by player → session.
+ * GET  /logs/:room/:player — logs for a specific player (optional ?session=).
+ * GET  /logs/server — server-side event logs.
  * GET  /health — liveness check.
  *
  * Merge strategy:
  *   weapon / ability / melee  — from the most recently updated player
- *   crystals                  — sum of all players' OWN contribution (clients track this
- *                               via delta-tracking to avoid the feedback loop)
- *   health                    — sum of all players' OWN contribution (same delta-tracking
- *                               as crystals — damage to one player shrinks the shared pool)
- *   weaponMods/abilityMods/meleeMods/perks/relics — sum of each player's OWN count per
- *                              item name; clients delta-track so they never push synced items back
- *
- * No authentication — rooms are isolated by the session host's name (auto-detected by clients).
+ *   crystals                  — sum of all players' OWN contribution (delta-tracked)
+ *   health                    — sum of all players' OWN contribution (delta-tracked)
+ *   weaponMods/abilityMods/meleeMods/perks/relics — MAX count per item name across players
  *
  * Run: node server.js [port]   (default: 3000)
  */
 
 const express = require('express');
+const fs      = require('fs');
+const path    = require('path');
 const app  = express();
 const PORT = process.argv[2] ? parseInt(process.argv[2]) : 3000;
 
-app.use(express.json({ limit: '1mb' }));
+const LOGS_DIR = path.join(__dirname, 'logs');
+if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR);
+
+app.use(express.json({ limit: '5mb' }));   // increased for log payloads
+
+// ============================================================
+// DATA STORES
+// ============================================================
 
 // rooms[roomCode][playerName] = { inventory, updatedAt, lastSeen }
 const rooms = {};
 const serverStartTime = Date.now();
 
-// Players not seen (via sync heartbeat) for longer than this are excluded from
-// the merge — they've disconnected or crashed.  10 s = 20 missed 500 ms polls.
-const STALE_MS = 10_000;
+// playerLogs[room][player][session] = [ { t, cat, msg, data }, ... ]
+const playerLogs = {};
 
-// Periodically remove players silent for >60 s and empty rooms to free memory.
+// serverLogs = [ { t, cat, msg, data }, ... ]
+const serverLogs = [];
+
+// Load persisted logs from disk on startup
+(function loadPersistedLogs() {
+    try {
+        const cutoff = Date.now() - 12 * 60 * 60 * 1000;
+        const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.jsonl'));
+        let totalEntries = 0;
+        for (const file of files) {
+            if (file === '__server.jsonl') continue;
+            // Filename format: room__player__session.jsonl
+            // room and player may contain __ so we split from the right by known session pattern
+            const base = file.slice(0, -6); // strip .jsonl
+            // Session ID format: YYYYMMDD-HHMMSS — always last two __-separated parts
+            const parts = base.split('__');
+            if (parts.length < 3) continue;
+            const session = parts.slice(-2).join('-').replace('-', '-'); // rejoin YYYYMMDD-HHMMSS
+            // Actually session is stored as parts[-2] + '__' + parts[-1]? No — session is "20260321-143052"
+            // The session has no __ so it occupies exactly 1 part. player has no __ (it's a gamertag).
+            // Format: {room}__{player}__{session}.jsonl
+            // Since room could theoretically have __ we split as: everything before last two parts
+            const sess    = parts[parts.length - 1];
+            const player  = parts[parts.length - 2];
+            const room    = parts.slice(0, parts.length - 2).join('__');
+            if (!room || !player || !sess) continue;
+            const content = fs.readFileSync(path.join(LOGS_DIR, file), 'utf8');
+            const entries = content.split('\n').filter(Boolean).map(line => {
+                try { return JSON.parse(line); } catch { return null; }
+            }).filter(e => e && (e.receivedAt || (e.t < 1e12 ? e.t * 1000 : e.t)) > cutoff);
+            if (entries.length > 0) {
+                if (!playerLogs[room]) playerLogs[room] = {};
+                if (!playerLogs[room][player]) playerLogs[room][player] = {};
+                playerLogs[room][player][sess] = entries;
+                totalEntries += entries.length;
+            } else {
+                // All entries expired — remove file
+                try { fs.unlinkSync(path.join(LOGS_DIR, file)); } catch {}
+            }
+        }
+        // Load server logs
+        const srvFile = path.join(LOGS_DIR, '__server.jsonl');
+        if (fs.existsSync(srvFile)) {
+            const content = fs.readFileSync(srvFile, 'utf8');
+            const entries = content.split('\n').filter(Boolean).map(line => {
+                try { return JSON.parse(line); } catch { return null; }
+            }).filter(e => e && e.t > cutoff);
+            serverLogs.push(...entries);
+        }
+        const roomCount = Object.keys(playerLogs).length;
+        if (roomCount > 0 || serverLogs.length > 0)
+            console.log(`[INIT] Loaded persisted logs: ${roomCount} rooms, ${totalEntries} client entries, ${serverLogs.length} server entries`);
+    } catch (e) {
+        console.error('[INIT] Failed to load persisted logs:', e.message);
+    }
+})();
+
+const STALE_MS     = 10_000;   // exclude from merge after 10s
+const LOG_TTL_MS   = 12 * 60 * 60 * 1000;  // 12 hours
+
+// ============================================================
+// SERVER-SIDE LOGGING
+// ============================================================
+function srvLog(cat, msg, data) {
+    const entry = { t: Date.now(), cat, msg };
+    if (data) entry.data = data;
+    serverLogs.push(entry);
+    const dataStr = data ? ' | ' + JSON.stringify(data) : '';
+    console.log(`[SRV:${cat}] ${msg}${dataStr}`);
+    try { fs.appendFileSync(path.join(LOGS_DIR, '__server.jsonl'), JSON.stringify(entry) + '\n', 'utf8'); } catch {}
+}
+
+// ============================================================
+// CLEANUP
+// ============================================================
+
+// Remove stale players every 15s, empty rooms
 setInterval(() => {
     const cutoff = Date.now() - 60_000;
     for (const [code, room] of Object.entries(rooms)) {
         for (const [name, data] of Object.entries(room)) {
             if (name === '__members') continue;
             if ((data.lastSeen || data.updatedAt) < cutoff) {
-                console.log(`[${code}] Pruning inactive player "${name}"`);
+                srvLog('CLEANUP', `Pruned inactive player "${name}"`, { room: code });
                 delete room[name];
             }
         }
         const playerCount = Object.keys(room).filter(k => k !== '__members').length;
-        if (playerCount === 0) delete rooms[code];
+        if (playerCount === 0) {
+            srvLog('CLEANUP', `Removed empty room`, { room: code });
+            delete rooms[code];
+        }
     }
 }, 15_000);
+
+// Purge logs older than 12 hours every 60s
+setInterval(() => {
+    const cutoff = Date.now() - LOG_TTL_MS;
+
+    // Purge player logs
+    for (const [room, players] of Object.entries(playerLogs)) {
+        for (const [player, sessions] of Object.entries(players)) {
+            for (const [session, entries] of Object.entries(sessions)) {
+                // Check the most recent entry's timestamp
+                if (entries.length > 0) {
+                    const latest = entries[entries.length - 1];
+                    // Convert epoch seconds (from Lua os.time()) to ms
+                    const latestMs = latest.t < 1e12 ? latest.t * 1000 : latest.t;
+                    if (latestMs < cutoff) {
+                        delete sessions[session];
+                        // Remove expired disk file
+                        try { fs.unlinkSync(path.join(LOGS_DIR, `${room}__${player}__${session}.jsonl`)); } catch {}
+                    }
+                }
+            }
+            if (Object.keys(sessions).length === 0) delete players[player];
+        }
+        if (Object.keys(players).length === 0) delete playerLogs[room];
+    }
+
+    // Purge old server logs from memory, then compact the disk file
+    while (serverLogs.length > 0 && serverLogs[0].t < cutoff) {
+        serverLogs.shift();
+    }
+    try {
+        const srvFile = path.join(LOGS_DIR, '__server.jsonl');
+        fs.writeFileSync(srvFile, serverLogs.map(e => JSON.stringify(e)).join('\n') + (serverLogs.length ? '\n' : ''), 'utf8');
+    } catch {}
+}, 60_000);
+
+// ============================================================
+// HELPERS
+// ============================================================
 
 function getRoom(roomCode) {
     if (!rooms[roomCode]) rooms[roomCode] = {};
@@ -57,14 +181,11 @@ function getRoom(roomCode) {
 function mergeInventories(room) {
     const now = Date.now();
     const members = room.__members;
-    // Only include players whose heartbeat (lastSeen) is fresh enough.
-    // Fall back to updatedAt for players who joined before heartbeat tracking.
-    // If the room has a members set (from the latest push), also restrict to those names.
     const players = Object.entries(room)
         .filter(([name]) => name !== '__members')
         .filter(([name, p]) => (now - (p.lastSeen || p.updatedAt)) < STALE_MS)
         .filter(([name]) => !members || members.has(name))
-        .map(([, data]) => data);
+        .map(([name, data]) => ({ name, ...data }));
     if (players.length === 0) return null;
 
     players.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -78,6 +199,7 @@ function mergeInventories(room) {
         melee:       newest.melee   || '',
         crystals:    0,
         health:      0,
+        maxHealth:   0,
         weaponMods:  [],
         abilityMods: [],
         meleeMods:   [],
@@ -86,10 +208,10 @@ function mergeInventories(room) {
         slots:       { weaponMods: 0, abilityMods: 0, meleeMods: 0, perks: 0 },
     };
 
-    // Clients delta-track their own contributions so they never push items received
-    // via a sync apply back to the server.  We sum counts directly — this correctly
-    // handles stacked duplicates (same name N times = N stacks) without feedback loops.
-    const modCounts = {
+    // modMax[category][name] = { count, level, accum }
+    // Tracks the best values seen across all players for each item.
+    // Handles both the new {n,l,a} object format and the legacy plain-string format.
+    const modMax = {
         weaponMods:  {},
         abilityMods: {},
         meleeMods:   {},
@@ -97,33 +219,71 @@ function mergeInventories(room) {
         relics:      {},
     };
 
-    for (const { inventory: inv } of players) {
+    for (const p of players) {
+        const inv = p.inventory;
         if (!inv) continue;
         if (inv.crystals) merged.crystals += inv.crystals;
-        if (inv.health)   merged.health   += inv.health;
+        if (inv.health)    merged.health    += inv.health;
+        // maxHealth: SUM contributions from each player (delta-tracked on client).
+        // Two players each contributing 250 maxHP → merged 500 maxHP for everyone.
+        // Items that boost maxHP are already shared via item sync, so the maxHealth
+        // pool naturally reflects perk bonuses without double-counting.
+        if (inv.maxHealth) merged.maxHealth += inv.maxHealth;
         for (const key of ['weaponMods', 'abilityMods', 'meleeMods', 'perks', 'relics']) {
-            for (const name of (inv[key] || [])) {
-                if (name) modCounts[key][name] = (modCounts[key][name] || 0) + 1;
+            // Each element is either a legacy plain string or a new {n, l, a} object.
+            // Normalise to { name, level, accum } then merge into modMax.
+            const playerBest = {};   // name → { count, level, accum } for this player's push
+            for (const item of (inv[key] || [])) {
+                const name  = typeof item === 'string' ? item : (item && item.n);
+                const level = (typeof item === 'object' && item) ? (item.l || 1) : 1;
+                const accum = (typeof item === 'object' && item) ? (item.a || 0) : 0;
+                if (!name) continue;
+                if (!playerBest[name]) playerBest[name] = { count: 0, level: 1, accum: 0 };
+                playerBest[name].count++;
+                if (level > playerBest[name].level) playerBest[name].level = level;
+                if (accum > playerBest[name].accum) playerBest[name].accum = accum;
+            }
+            for (const [name, data] of Object.entries(playerBest)) {
+                if (!modMax[key][name]) modMax[key][name] = { count: 0, level: 1, accum: 0 };
+                // count: take the max across players (so if two players both have 3×EscalatingShot,
+                //        merged still shows 3, not 6).
+                if (data.count > modMax[key][name].count) modMax[key][name].count = data.count;
+                // level: take the highest level seen (best version wins).
+                if (data.level > modMax[key][name].level) modMax[key][name].level = data.level;
+                // accum: take the highest accumulated buff (relics accumulate over time).
+                if (data.accum > modMax[key][name].accum) modMax[key][name].accum = data.accum;
             }
         }
         if (inv.slots) {
+            // SUM contributions from each player (delta-tracked on client, just like crystals).
+            // Each player reports only the slots they personally unlocked, so summing
+            // is correct and avoids the doubling feedback loop.
             for (const k of ['weaponMods', 'abilityMods', 'meleeMods', 'perks']) {
-                if ((inv.slots[k] || 0) > merged.slots[k]) merged.slots[k] = inv.slots[k];
+                merged.slots[k] += (inv.slots[k] || 0);
             }
         }
     }
 
+    // Output merged mod arrays in the new {n, l, a} object format.
+    // The client's parseItemArray decoder handles both this and the legacy string format,
+    // but sending the full object ensures Level and AccumulatedBuff round-trip correctly.
     for (const key of ['weaponMods', 'abilityMods', 'meleeMods', 'perks', 'relics']) {
-        for (const [name, count] of Object.entries(modCounts[key])) {
-            for (let i = 0; i < count; i++) merged[key].push(name);
+        for (const [name, data] of Object.entries(modMax[key])) {
+            for (let i = 0; i < data.count; i++) {
+                merged[key].push({ n: name, l: data.level, a: data.accum });
+            }
         }
     }
 
     return merged;
 }
 
+// ============================================================
+// ROUTES
+// ============================================================
+
 app.post('/push', (req, res) => {
-    const { room, player, inventory, password, players } = req.body;
+    const { room, player, inventory, password, players, session, logs } = req.body;
     if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
     if (!room || !player || !inventory) {
         return res.status(400).json({ error: 'Missing fields' });
@@ -133,26 +293,46 @@ app.post('/push', (req, res) => {
     const now = Date.now();
     r[player] = { inventory, updatedAt: now, lastSeen: now };
 
-    // If the client sent a players list, record it — used to restrict merge to session members.
     if (Array.isArray(players) && players.length > 0) {
         r.__members = new Set(players);
     }
+
+    // Store client logs
+    if (Array.isArray(logs) && logs.length > 0 && session) {
+        if (!playerLogs[room]) playerLogs[room] = {};
+        if (!playerLogs[room][player]) playerLogs[room][player] = {};
+        if (!playerLogs[room][player][session]) playerLogs[room][player][session] = [];
+        const arr = playerLogs[room][player][session];
+        const newEntries = logs.map(entry => ({
+            t: entry.t,
+            cat: entry.cat || '?',
+            msg: entry.msg || '',
+            data: entry.data || null,
+            receivedAt: now,
+        }));
+        for (const entry of newEntries) arr.push(entry);
+        // Persist to disk
+        const logFile = path.join(LOGS_DIR, `${room}__${player}__${session}.jsonl`);
+        const lines = newEntries.map(e => JSON.stringify(e)).join('\n') + '\n';
+        try { fs.appendFileSync(logFile, lines, 'utf8'); } catch {}
+    }
+
     const merged = mergeInventories(r);
 
-    const fmt = (arr) => arr?.length ? arr.join(', ') : '(none)';
-    console.log(
-        `[${room}] Push from "${player}"\n` +
-        `  weapon     : ${inventory.weapon || '(none)'}\n` +
-        `  ability    : ${inventory.ability || '(none)'}\n` +
-        `  melee      : ${inventory.melee || '(none)'}\n` +
-        `  crystals   : ${inventory.crystals ?? 0}\n` +
-        `  health     : ${inventory.health ?? 0}\n` +
-        `  weaponMods : ${fmt(inventory.weaponMods)}\n` +
-        `  abilityMods: ${fmt(inventory.abilityMods)}\n` +
-        `  meleeMods  : ${fmt(inventory.meleeMods)}\n` +
-        `  perks      : ${fmt(inventory.perks)}\n` +
-        `  relics     : ${fmt(inventory.relics)}`
-    );
+    srvLog('PUSH', `Push from "${player}" in room "${room}"`, {
+        weapon: inventory.weapon || '(none)',
+        ability: inventory.ability || '(none)',
+        melee: inventory.melee || '(none)',
+        crystals: inventory.crystals ?? 0,
+        health: inventory.health ?? 0,
+        wMods: (inventory.weaponMods || []).length,
+        aMods: (inventory.abilityMods || []).length,
+        mMods: (inventory.meleeMods || []).length,
+        perks: (inventory.perks || []).length,
+        relics: (inventory.relics || []).length,
+        clientLogs: (logs || []).length,
+        session: session || '(none)',
+    });
 
     res.json({ inventory: merged });
 });
@@ -163,8 +343,6 @@ app.get('/sync/:room', (req, res) => {
     res.json({ inventory: mergeInventories(r) });
 });
 
-// Dedicated heartbeat — silent, no logging.  Bridge calls this every 500 ms
-// so the server knows the player is still connected even if inventory is unchanged.
 app.post('/heartbeat', (req, res) => {
     const { room, player, password } = req.body || {};
     if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
@@ -181,8 +359,8 @@ app.post('/leave', (req, res) => {
     const r = rooms[room];
     if (r && r[player]) {
         delete r[player];
-        if (Object.keys(r).length === 0) delete rooms[room];
-        console.log(`[${room}] "${player}" left`);
+        if (Object.keys(r).filter(k => k !== '__members').length === 0) delete rooms[room];
+        srvLog('LEAVE', `"${player}" left room "${room}"`);
     }
     res.json({ ok: true });
 });
@@ -190,13 +368,81 @@ app.post('/leave', (req, res) => {
 app.get('/health', (req, res) => {
     const summary = Object.entries(rooms).map(([code, room]) => ({
         room:    code,
-        players: Object.keys(room).length,
+        players: Object.keys(room).filter(k => k !== '__members').length,
     }));
     res.json({ ok: true, rooms: summary });
 });
 
-// Full rooms state for the dashboard — returns every room with per-player
-// inventories, timestamps, expected member list, plus the pre-computed merged inventory.
+// ============================================================
+// LOG ENDPOINTS
+// ============================================================
+
+// Server-side logs — must be defined BEFORE /logs/:room to prevent Express
+// matching "server" as a room name.
+app.get('/logs/server', (req, res) => {
+    const since = parseInt(req.query.since) || 0;
+    const filtered = since ? serverLogs.filter(e => e.t > since) : serverLogs;
+    res.json(filtered);
+});
+
+// Index of all rooms that have logs (works even when room is no longer active)
+app.get('/logs', (req, res) => {
+    const result = {};
+    for (const [room, players] of Object.entries(playerLogs)) {
+        result[room] = {};
+        for (const [player, sessions] of Object.entries(players)) {
+            result[room][player] = Object.keys(sessions).map(s => ({
+                session: s,
+                count: sessions[s].length,
+                latest: sessions[s].length > 0 ? sessions[s][sessions[s].length - 1].receivedAt : 0,
+            }));
+        }
+    }
+    res.json({ rooms: result, serverLogCount: serverLogs.length });
+});
+
+// All logs for a room, organised by player → session
+app.get('/logs/:room', (req, res) => {
+    const room = req.params.room;
+    const since = parseInt(req.query.since) || 0;
+    const data = playerLogs[room];
+    if (!data) return res.json({});
+    const result = {};
+    for (const [player, sessions] of Object.entries(data)) {
+        result[player] = {};
+        for (const [session, entries] of Object.entries(sessions)) {
+            const filtered = since ? entries.filter(e => (e.receivedAt || 0) > since) : entries;
+            if (filtered.length > 0) result[player][session] = filtered;
+        }
+        if (Object.keys(result[player]).length === 0) delete result[player];
+    }
+    res.json(result);
+});
+
+// Logs for a specific player in a room
+app.get('/logs/:room/:player', (req, res) => {
+    const { room, player } = req.params;
+    const sessionFilter = req.query.session;
+    const since = parseInt(req.query.since) || 0;
+    const data = playerLogs[room]?.[player];
+    if (!data) return res.json({});
+    if (sessionFilter) {
+        const entries = data[sessionFilter] || [];
+        const filtered = since ? entries.filter(e => (e.receivedAt || 0) > since) : entries;
+        return res.json({ [sessionFilter]: filtered });
+    }
+    const result = {};
+    for (const [session, entries] of Object.entries(data)) {
+        const filtered = since ? entries.filter(e => (e.receivedAt || 0) > since) : entries;
+        if (filtered.length > 0) result[session] = filtered;
+    }
+    res.json(result);
+});
+
+// ============================================================
+// ROOMS ENDPOINT (dashboard data)
+// ============================================================
+
 app.get('/rooms', (req, res) => {
     const out = {};
     for (const [code, room] of Object.entries(rooms)) {
@@ -212,8 +458,20 @@ app.get('/rooms', (req, res) => {
         };
     }
     const totalPlayers = Object.values(out).reduce((s, r) => s + Object.keys(r.players).length, 0);
-    res.json({ rooms: out, uptime: Date.now() - serverStartTime, totalPlayers });
+    // Include log session info for the dashboard
+    const logInfo = {};
+    for (const [room, players] of Object.entries(playerLogs)) {
+        logInfo[room] = {};
+        for (const [player, sessions] of Object.entries(players)) {
+            logInfo[room][player] = Object.keys(sessions);
+        }
+    }
+    res.json({ rooms: out, uptime: Date.now() - serverStartTime, totalPlayers, logInfo });
 });
+
+// ============================================================
+// DASHBOARD HTML
+// ============================================================
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -260,6 +518,7 @@ main{padding:22px 24px;max-width:1800px;margin:0 auto}
 .sec{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px;display:flex;align-items:center;gap:6px}
 .sec-merged{color:#58a6ff}
 .sec-players{color:#8b949e}
+.sec-logs{color:#d2a8ff}
 
 .merged-box{background:#0d1117;border:1px solid #1c3b5e;border-radius:8px;padding:14px 16px}
 
@@ -299,6 +558,41 @@ main{padding:22px 24px;max-width:1800px;margin:0 auto}
 .slot-chip b{color:#c9d1d9}
 
 .no-rooms{color:#8b949e;font-style:italic;text-align:center;padding:80px 20px;font-size:15px}
+
+/* Log viewer styles */
+.log-panel{background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+.log-tabs{display:flex;gap:0;border-bottom:1px solid #30363d;overflow-x:auto}
+.log-tab{padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:transparent;color:#8b949e;white-space:nowrap;border-bottom:2px solid transparent;transition:all .15s}
+.log-tab:hover{color:#e6edf3;background:#161b22}
+.log-tab.active{color:#d2a8ff;border-bottom-color:#d2a8ff;background:#161b22}
+.log-filters{display:flex;gap:4px;padding:8px 12px;border-bottom:1px solid #21262d;flex-wrap:wrap;align-items:center}
+.log-filter{padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;cursor:pointer;border:1px solid #30363d;transition:all .15s}
+.log-filter.on{opacity:1}.log-filter.off{opacity:0.35}
+.lf-INIT{background:#21262d;color:#8b949e}
+.lf-READ{background:#0f1e30;color:#79c0ff}
+.lf-PUSH{background:#0f2b1a;color:#7ee787}
+.lf-APPLY{background:#2a1f5a;color:#d2a8ff}
+.lf-ROOM{background:#0f2b2a;color:#56d4dd}
+.lf-TRANSITION{background:#2d1f0a;color:#ffa657}
+.lf-F9{background:#2d2206;color:#d29922}
+.lf-ERROR{background:#3a0f0f;color:#ff7b7b}
+.lf-CLEANUP{background:#21262d;color:#8b949e}
+.lf-LEAVE{background:#2d0f1a;color:#ffa198}
+.lf-MERGE{background:#1c3b5e;color:#79c0ff}
+.log-search{background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:4px 8px;border-radius:4px;font-size:11px;flex:1;min-width:120px;max-width:250px}
+.log-body{max-height:500px;overflow-y:auto;font-family:'Cascadia Code','Consolas',monospace;font-size:11px;line-height:1.6}
+.log-entry{padding:2px 12px;border-bottom:1px solid #161b22;display:flex;gap:8px;align-items:flex-start}
+.log-entry:hover{background:#161b22}
+.log-ts{color:#484f58;flex-shrink:0;min-width:70px}
+.log-cat{border-radius:3px;padding:0 5px;font-size:10px;font-weight:700;flex-shrink:0;min-width:64px;text-align:center}
+.log-msg{color:#c9d1d9;flex:1;word-break:break-word}
+.log-data{color:#8b949e;cursor:pointer;text-decoration:underline dotted;font-size:10px;flex-shrink:0}
+.log-data-expanded{color:#8b949e;font-size:10px;padding:2px 12px 6px 155px;word-break:break-all;border-bottom:1px solid #161b22;background:#0a0d12}
+.log-controls{display:flex;gap:8px;padding:6px 12px;border-bottom:1px solid #21262d;align-items:center}
+.log-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;padding:3px 10px;border-radius:4px;font-size:10px;cursor:pointer}
+.log-btn:hover{color:#e6edf3;background:#30363d}
+.log-btn.active{color:#3fb950;border-color:#238636}
+.log-count{font-size:10px;color:#484f58;margin-left:auto}
 </style>
 </head>
 <body>
@@ -306,12 +600,16 @@ main{padding:22px 24px;max-width:1800px;margin:0 auto}
   <div class="hdr-left">
     <h1>&#x1F980; CrabInventorySync</h1>
     <div class="live-badge"><span class="dot"></span>Live</div>
+    <a href="/log-viewer" style="color:#d2a8ff;font-size:12px;font-weight:600;text-decoration:none;padding:3px 10px;border:1px solid #3d2b5e;border-radius:20px;background:#1a0f2e">&#x1F4CB; Logs</a>
   </div>
   <span id="statusLine">connecting&hellip;</span>
 </header>
 <div class="stats-bar" id="statsBar"></div>
 <main id="app"></main>
 <script>
+var logState={};  // per-room state: { activeTab, filters, search, autoScroll, expandedRows, lastSince }
+var cachedLogs={};  // per-room cached log data
+
 function esc(s){
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -335,7 +633,12 @@ function pill(text,cls){
 }
 function pillList(arr,cls){
   if(!arr||!arr.length) return '<span class="none">&mdash;</span>';
-  return arr.map(function(x){return pill(x,cls);}).join('');
+  return arr.map(function(x){
+    // Items are now {n,l,a} objects; fall back to plain strings for legacy payloads.
+    var name = (x && typeof x === 'object') ? (x.n || '?') : String(x);
+    var lvl  = (x && typeof x === 'object' && x.l > 1) ? ' <sup>×'+x.l+'</sup>' : '';
+    return '<span class="pill '+cls+'">'+esc(name)+lvl+'</span>';
+  }).join('');
 }
 function row(label,html){
   return '<div class="inv-row"><span class="inv-lbl">'+label+'</span><div class="pills">'+html+'</div></div>';
@@ -379,7 +682,116 @@ function renderPlayerCard(name,data){
     renderInv(data.inventory) +
     '</div>';
 }
-function renderRoom(code,roomData){
+
+function getLogState(room){
+  if(!logState[room]) logState[room]={activeTab:null,filters:{INIT:true,READ:true,PUSH:true,APPLY:true,ROOM:true,TRANSITION:true,F9:true,ERROR:true,CLEANUP:true,LEAVE:true,MERGE:true,PUSH_RECV:true},search:'',autoScroll:true,expandedRows:{}};
+  return logState[room];
+}
+
+function formatLogTime(t){
+  // t may be epoch seconds (Lua) or epoch ms (server)
+  var d = t < 1e12 ? new Date(t*1000) : new Date(t);
+  return d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+
+function catClass(cat){
+  var known=['INIT','READ','PUSH','APPLY','ROOM','TRANSITION','F9','ERROR','CLEANUP','LEAVE','MERGE','PUSH_RECV'];
+  return known.indexOf(cat)>=0 ? 'lf-'+cat : 'lf-INIT';
+}
+
+function renderLogEntries(entries, state, room){
+  var search=state.search.toLowerCase();
+  var filtered=entries.filter(function(e){
+    if(!state.filters[e.cat] && state.filters[e.cat]!==undefined) return false;
+    if(search){
+      var txt=(e.msg||'')+(e.data||'')+(e.cat||'');
+      if(txt.toLowerCase().indexOf(search)<0) return false;
+    }
+    return true;
+  });
+  // Show newest at top
+  var reversed=filtered.slice().reverse();
+  var html='';
+  for(var i=0;i<reversed.length;i++){
+    var e=reversed[i];
+    var rowId=room+'_'+i;
+    var expanded=!!state.expandedRows[rowId];
+    html+='<div class="log-entry">'+
+      '<span class="log-ts">'+formatLogTime(e.t)+'</span>'+
+      '<span class="log-cat '+catClass(e.cat)+'">'+esc(e.cat)+'</span>'+
+      '<span class="log-msg">'+esc(e.msg)+'</span>';
+    if(e.data){
+      html+='<span class="log-data" onclick="toggleLogData(\\''+esc(room)+'\\',\\''+rowId+'\\')">'+
+        (expanded?'[-]':'[+] data')+'</span>';
+    }
+    html+='</div>';
+    if(expanded && e.data){
+      html+='<div class="log-data-expanded">'+esc(e.data)+'</div>';
+    }
+  }
+  return {html:html,total:entries.length,shown:filtered.length};
+}
+
+function renderLogPanel(room, logInfo){
+  var state=getLogState(room);
+  // Build tab list: players + Server
+  var tabs=[];
+  if(logInfo && logInfo[room]){
+    for(var player in logInfo[room]){
+      tabs.push({id:'p:'+player,label:player,type:'player',player:player});
+    }
+  }
+  tabs.push({id:'server',label:'Server',type:'server'});
+
+  if(!state.activeTab && tabs.length>0) state.activeTab=tabs[0].id;
+
+  var tabHtml=tabs.map(function(t){
+    var cls=t.id===state.activeTab?'log-tab active':'log-tab';
+    return '<button class="'+cls+'" onclick="setLogTab(\\''+esc(room)+'\\',\\''+esc(t.id)+'\\')">'+esc(t.label)+'</button>';
+  }).join('');
+
+  var cats=['INIT','READ','PUSH','APPLY','ROOM','TRANSITION','F9','ERROR','CLEANUP','LEAVE','MERGE'];
+  var filterHtml=cats.map(function(c){
+    var on=state.filters[c]!==false;
+    return '<span class="log-filter '+(on?'on':'off')+' lf-'+c+'" onclick="toggleLogFilter(\\''+esc(room)+'\\',\\''+c+'\\')">'+c+'</span>';
+  }).join('');
+
+  var searchVal=state.search||'';
+
+  // Get cached entries for the active tab
+  var entries=[];
+  var cached=cachedLogs[room];
+  if(cached){
+    var at=state.activeTab;
+    if(at==='server'){
+      entries=cached.__server||[];
+    } else if(at && at.startsWith('p:')){
+      var pname=at.substring(2);
+      if(cached[pname]){
+        // Flatten all sessions
+        for(var sess in cached[pname]){
+          entries=entries.concat(cached[pname][sess]);
+        }
+        entries.sort(function(a,b){return a.t-b.t;});
+      }
+    }
+  }
+
+  var result=renderLogEntries(entries, state, room);
+
+  return '<div class="log-panel">'+
+    '<div class="log-tabs">'+tabHtml+'</div>'+
+    '<div class="log-controls">'+
+      '<div class="log-filters">'+filterHtml+'</div>'+
+      '<input class="log-search" placeholder="Search logs..." value="'+esc(searchVal)+'" oninput="setLogSearch(\\''+esc(room)+'\\',this.value)">'+
+      '<button class="log-btn '+(state.autoScroll?'active':'')+'" onclick="toggleAutoScroll(\\''+esc(room)+'\\')">Auto-scroll</button>'+
+      '<span class="log-count">'+result.shown+'/'+result.total+' entries</span>'+
+    '</div>'+
+    '<div class="log-body" id="logBody_'+esc(room)+'">'+result.html+'</div>'+
+    '</div>';
+}
+
+function renderRoom(code,roomData,logInfo){
   var playerEntries=Object.entries(roomData.players||{});
   var members=roomData.members;
   var connectedSet={};
@@ -413,32 +825,78 @@ function renderRoom(code,roomData){
       '<div class="players-grid">'+cards+'</div></div>';
   }
 
+  var logSection=
+    '<div><div class="sec sec-logs">&#x1F4CB; Logs</div>' +
+    renderLogPanel(code, logInfo) + '</div>';
+
   return '<div class="room">' +
     '<div class="room-header">' +
       '<span class="room-name">'+esc(code)+'</span>' +
       '<div class="room-badges">'+badges+'</div>' +
     '</div>' +
     mrow +
-    '<div class="room-body">'+mergedSection+playersSection+'</div>' +
+    '<div class="room-body">'+mergedSection+playersSection+logSection+'</div>' +
     '</div>';
 }
+
+// Log interaction handlers
+window.setLogTab=function(room,tab){getLogState(room).activeTab=tab;renderNow();};
+window.toggleLogFilter=function(room,cat){var s=getLogState(room);s.filters[cat]=s.filters[cat]===false?true:false;renderNow();};
+window.setLogSearch=function(room,val){getLogState(room).search=val;renderNow();};
+window.toggleAutoScroll=function(room){var s=getLogState(room);s.autoScroll=!s.autoScroll;renderNow();};
+window.toggleLogData=function(room,rowId){var s=getLogState(room);s.expandedRows[rowId]=!s.expandedRows[rowId];renderNow();};
+
+var lastLogFetch=0;
+async function fetchLogs(roomCodes){
+  var now=Date.now();
+  // Fetch logs every 2 seconds
+  if(now-lastLogFetch<2000) return;
+  lastLogFetch=now;
+  for(var i=0;i<roomCodes.length;i++){
+    var code=roomCodes[i];
+    try{
+      var data=await fetch('/logs/'+encodeURIComponent(code)).then(function(r){return r.json();});
+      cachedLogs[code]=data;
+    }catch(e){}
+  }
+  // Fetch server logs
+  try{
+    var sdata=await fetch('/logs/server').then(function(r){return r.json();});
+    // Store server logs under a special key for each room
+    for(var i=0;i<roomCodes.length;i++){
+      if(!cachedLogs[roomCodes[i]]) cachedLogs[roomCodes[i]]={};
+      cachedLogs[roomCodes[i]].__server=sdata;
+    }
+  }catch(e){}
+}
+
+function renderNow(){
+  if(window._lastRoomData) doRender(window._lastRoomData);
+}
+function doRender(data){
+  window._lastRoomData=data;
+  var entries=Object.entries(data.rooms||{});
+
+  document.getElementById('statsBar').innerHTML=
+    '<div class="stat"><span class="stat-icon">&#x1F3E0;</span><span class="stat-label">Rooms</span><span class="stat-value">'+entries.length+'</span></div>'+
+    '<div class="stat"><span class="stat-icon">&#x1F464;</span><span class="stat-label">Players</span><span class="stat-value">'+(data.totalPlayers||0)+'</span></div>'+
+    '<div class="stat"><span class="stat-icon">&#x23F1;</span><span class="stat-label">Uptime</span><span class="stat-value">'+(data.uptime?formatUptime(data.uptime):'&mdash;')+'</span></div>';
+
+  var app=document.getElementById('app');
+  if(!entries.length){
+    app.innerHTML='<div class="no-rooms">No active rooms &mdash; waiting for players to connect.</div>';
+  } else {
+    app.innerHTML=entries.map(function(e){return renderRoom(e[0],e[1],data.logInfo);}).join('');
+  }
+  document.getElementById('statusLine').textContent='updated '+new Date().toLocaleTimeString();
+}
+
 async function refresh(){
   try{
     var data=await fetch('/rooms').then(function(r){return r.json();});
-    var entries=Object.entries(data.rooms||{});
-
-    document.getElementById('statsBar').innerHTML=
-      '<div class="stat"><span class="stat-icon">&#x1F3E0;</span><span class="stat-label">Rooms</span><span class="stat-value">'+entries.length+'</span></div>'+
-      '<div class="stat"><span class="stat-icon">&#x1F464;</span><span class="stat-label">Players</span><span class="stat-value">'+(data.totalPlayers||0)+'</span></div>'+
-      '<div class="stat"><span class="stat-icon">&#x23F1;</span><span class="stat-label">Uptime</span><span class="stat-value">'+(data.uptime?formatUptime(data.uptime):'&mdash;')+'</span></div>';
-
-    var app=document.getElementById('app');
-    if(!entries.length){
-      app.innerHTML='<div class="no-rooms">No active rooms &mdash; waiting for players to connect.</div>';
-    } else {
-      app.innerHTML=entries.map(function(e){return renderRoom(e[0],e[1]);}).join('');
-    }
-    document.getElementById('statusLine').textContent='updated '+new Date().toLocaleTimeString();
+    var roomCodes=Object.keys(data.rooms||{});
+    await fetchLogs(roomCodes);
+    doRender(data);
   } catch(e){
     document.getElementById('statusLine').textContent='error: '+e.message;
   }
@@ -451,8 +909,393 @@ setInterval(refresh,500);
 
 app.get('/', (req, res) => res.setHeader('Content-Type', 'text/html').send(DASHBOARD_HTML));
 
+// ============================================================
+// FULL LOG VIEWER PAGE
+// ============================================================
+const LOG_VIEWER_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CrabInventorySync &mdash; Logs</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0d12;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+a{color:inherit;text-decoration:none}
+
+header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 24px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100;flex-wrap:wrap}
+h1{color:#f0883e;font-size:20px;font-weight:700;letter-spacing:-.3px}
+.back-btn{color:#8b949e;font-size:12px;padding:3px 10px;border:1px solid #30363d;border-radius:20px;background:#161b22;cursor:pointer}
+.back-btn:hover{color:#e6edf3;border-color:#58a6ff}
+.hdr-status{margin-left:auto;font-size:12px;color:#8b949e}
+
+.layout{display:flex;flex:1;min-height:0;overflow:hidden}
+
+/* Sidebar */
+.sidebar{width:260px;flex-shrink:0;background:#0d1117;border-right:1px solid #21262d;overflow-y:auto;display:flex;flex-direction:column}
+.sidebar-title{padding:12px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#484f58;border-bottom:1px solid #21262d}
+.tree-room{border-bottom:1px solid #1c2128}
+.tree-room-hdr{padding:8px 14px;font-size:13px;font-weight:700;color:#f0883e;display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+.tree-room-hdr:hover{background:#161b22}
+.tree-room-hdr .caret{font-size:10px;transition:transform .15s;display:inline-block}
+.tree-room-hdr.collapsed .caret{transform:rotate(-90deg)}
+.tree-player{padding:0}
+.tree-player-btn{width:100%;text-align:left;padding:6px 14px 6px 26px;font-size:12px;font-weight:600;color:#c9d1d9;background:none;border:none;cursor:pointer;display:flex;align-items:center;gap:6px}
+.tree-player-btn:hover{background:#161b22;color:#e6edf3}
+.tree-player-btn.active{background:#1c2128;color:#d2a8ff;border-left:2px solid #d2a8ff}
+.tree-session{width:100%;text-align:left;padding:4px 14px 4px 40px;font-size:11px;color:#8b949e;background:none;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between}
+.tree-session:hover{background:#161b22;color:#c9d1d9}
+.tree-session.active{background:#1c2128;color:#d2a8ff}
+.tree-session-count{font-size:10px;color:#484f58;margin-left:auto}
+.tree-server{width:100%;text-align:left;padding:8px 14px;font-size:12px;font-weight:600;color:#8b949e;background:none;border:none;cursor:pointer;display:flex;align-items:center;gap:6px;border-top:1px solid #21262d}
+.tree-server:hover{background:#161b22;color:#e6edf3}
+.tree-server.active{color:#d2a8ff;background:#1c2128}
+.no-logs-tree{padding:20px 14px;font-size:12px;color:#484f58;font-style:italic}
+
+/* Main log area */
+.log-main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.log-toolbar{padding:10px 16px;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:#0d1117}
+.log-toolbar-title{font-size:13px;font-weight:700;color:#e6edf3;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.filter-row{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.log-filter{padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;cursor:pointer;border:1px solid #30363d;transition:opacity .15s;user-select:none}
+.log-filter.on{opacity:1}.log-filter.off{opacity:0.3}
+.lf-INIT{background:#21262d;color:#8b949e}
+.lf-READ{background:#0f1e30;color:#79c0ff}
+.lf-PUSH{background:#0f2b1a;color:#7ee787}
+.lf-APPLY{background:#2a1f5a;color:#d2a8ff}
+.lf-ROOM{background:#0f2b2a;color:#56d4dd}
+.lf-TRANSITION{background:#2d1f0a;color:#ffa657}
+.lf-F9{background:#2d2206;color:#d29922}
+.lf-ERROR{background:#3a0f0f;color:#ff7b7b}
+.lf-CLEANUP{background:#21262d;color:#8b949e}
+.lf-LEAVE{background:#2d0f1a;color:#ffa198}
+.lf-MERGE{background:#1c3b5e;color:#79c0ff}
+.search-box{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:5px 10px;border-radius:6px;font-size:12px;width:220px}
+.search-box:focus{outline:none;border-color:#58a6ff}
+.log-count-badge{font-size:11px;color:#484f58;white-space:nowrap}
+.auto-scroll-btn{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid #30363d;background:#161b22;color:#8b949e}
+.auto-scroll-btn.on{border-color:#238636;color:#3fb950;background:#0f2b10}
+.copy-btn{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid #1c3b5e;background:#0f1e30;color:#79c0ff}
+.copy-btn:hover{border-color:#58a6ff;color:#e6edf3}
+.dl-btn{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid #2d1f0a;background:#1a1000;color:#ffa657}
+.dl-btn:hover{border-color:#ffa657;color:#e6edf3}
+
+.log-body{flex:1;overflow-y:auto;font-family:'Cascadia Code','Consolas',monospace;font-size:11.5px;line-height:1.7}
+.log-entry{padding:1px 16px;display:flex;gap:10px;align-items:flex-start;border-bottom:1px solid #0d1117}
+.log-entry:hover{background:#161b22}
+.log-entry.err{background:#1a0808}
+.log-ts{color:#484f58;flex-shrink:0;min-width:76px;font-size:11px;padding-top:1px}
+.log-cat-badge{border-radius:3px;padding:1px 6px;font-size:10px;font-weight:700;flex-shrink:0;min-width:72px;text-align:center;line-height:1.6}
+.log-msg{color:#c9d1d9;flex:1;word-break:break-word}
+.log-data-toggle{color:#484f58;font-size:10px;cursor:pointer;flex-shrink:0;padding:0 4px}
+.log-data-toggle:hover{color:#8b949e}
+.log-data-row{padding:2px 16px 6px 176px;font-size:10.5px;color:#8b949e;word-break:break-all;background:#0a0d12;border-bottom:1px solid #0d1117}
+
+.no-selection{display:flex;align-items:center;justify-content:center;flex:1;color:#484f58;font-size:14px;font-style:italic}
+.empty-log{padding:40px 20px;text-align:center;color:#484f58;font-size:13px;font-style:italic}
+</style>
+</head>
+<body>
+<header>
+  <a href="/" class="back-btn">&#x2190; Dashboard</a>
+  <h1>&#x1F4CB; Log Viewer</h1>
+  <span class="hdr-status" id="hdrStatus">loading&hellip;</span>
+</header>
+<div class="layout">
+  <div class="sidebar" id="sidebar"><div class="no-logs-tree">Loading&hellip;</div></div>
+  <div class="log-main" id="logMain">
+    <div class="no-selection">Select a player or session from the sidebar</div>
+  </div>
+</div>
+<script>
+var state={
+  selection:null,  // {type:'player'|'session'|'server', room, player, session}
+  filters:{INIT:true,READ:true,PUSH:true,APPLY:true,ROOM:true,TRANSITION:true,F9:true,ERROR:true,CLEANUP:true,LEAVE:true,MERGE:true},
+  search:'',
+  autoScroll:true,
+  expanded:{},   // room keys that are collapsed
+  expandedRows:{} // log entry data expansions
+};
+var allLogs={};     // room→player→session→entries
+var serverLogData=[];
+var logIndex={};    // from /logs index endpoint
+var refreshInterval=null;
+var lastScrollPos=0;
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+function formatTs(t){
+  var d=t<1e12?new Date(t*1000):new Date(t);
+  return d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'})+'.'+String(d.getMilliseconds()).padStart(3,'0');
+}
+function formatDate(t){
+  var d=t<1e12?new Date(t*1000):new Date(t);
+  return d.toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});
+}
+
+function catClass(cat){
+  var known=['INIT','READ','PUSH','APPLY','ROOM','TRANSITION','F9','ERROR','CLEANUP','LEAVE','MERGE'];
+  return known.includes(cat)?'lf-'+cat:'lf-INIT';
+}
+
+async function fetchAll(){
+  try{
+    document.getElementById('hdrStatus').textContent='loading index\u2026';
+    var idx=await fetch('/logs',{signal:AbortSignal.timeout(10000)}).then(function(r){
+      if(!r.ok) throw new Error('/logs returned '+r.status);
+      return r.json();
+    });
+    logIndex=idx.rooms||{};
+
+    document.getElementById('hdrStatus').textContent='loading logs\u2026';
+    for(var room of Object.keys(logIndex)){
+      var data=await fetch('/logs/'+encodeURIComponent(room),{signal:AbortSignal.timeout(10000)}).then(function(r){
+        if(!r.ok) throw new Error('/logs/'+encodeURIComponent(room)+' returned '+r.status);
+        return r.json();
+      });
+      allLogs[room]=data;
+    }
+
+    document.getElementById('hdrStatus').textContent='loading server logs\u2026';
+    serverLogData=await fetch('/logs/server',{signal:AbortSignal.timeout(10000)}).then(function(r){
+      if(!r.ok) throw new Error('/logs/server returned '+r.status);
+      return r.json();
+    });
+
+    document.getElementById('hdrStatus').textContent='updated '+new Date().toLocaleTimeString();
+    renderSidebar();
+    renderLogArea();
+  }catch(e){
+    console.error('[LogViewer] fetchAll error:',e);
+    document.getElementById('hdrStatus').textContent='error: '+e.message;
+    document.getElementById('sidebar').innerHTML=
+      '<div class="no-logs-tree" style="color:#ff7b7b">Load failed:<br>'+esc(String(e.message))+
+      '<br><br><button onclick="fetchAll()" style="margin-top:8px;padding:4px 12px;background:#21262d;'+
+      'border:1px solid #30363d;color:#c9d1d9;border-radius:4px;cursor:pointer">&#x21BB; Retry</button></div>';
+  }
+}
+
+function renderSidebar(){
+  var rooms=Object.keys(logIndex).sort();
+  if(rooms.length===0 && serverLogData.length===0){
+    document.getElementById('sidebar').innerHTML='<div class="no-logs-tree">No logs yet.<br>Start the game to begin collecting logs.</div>';
+    return;
+  }
+  var html='<div class="sidebar-title">Log Browser</div>';
+
+  // Server logs entry
+  var srvActive=state.selection&&state.selection.type==='server'?'active':'';
+  html+='<button class="tree-server '+srvActive+'" onclick="selectServer()">&#x1F4BB; Server ('+serverLogData.length+')</button>';
+
+  for(var room of rooms){
+    var collapsed=state.expanded[room]===false;
+    var caretCls=collapsed?'caret collapsed':'caret';
+    html+='<div class="tree-room">';
+    html+='<div class="tree-room-hdr '+(collapsed?'collapsed':'')+'" onclick="toggleRoom(\''+esc(room)+'\')"><span class="'+caretCls+'">&#x25BC;</span>&#x1F4E6; '+esc(room)+'</div>';
+    if(!collapsed){
+      var players=Object.keys(logIndex[room]||{}).sort();
+      for(var player of players){
+        var sessions=logIndex[room][player]||[];
+        var pActive=state.selection&&state.selection.type==='player'&&state.selection.room===room&&state.selection.player===player?'active':'';
+        var totalCount=sessions.reduce(function(s,x){return s+x.count;},0);
+        html+='<div class="tree-player">';
+        html+='<button class="tree-player-btn '+pActive+'" onclick="selectPlayer(\''+esc(room)+'\',\''+esc(player)+'\')">&#x1F464; '+esc(player)+' <span style="color:#484f58;font-size:10px;margin-left:auto">'+totalCount+'</span></button>';
+        sessions.sort(function(a,b){return b.latest-a.latest;});
+        for(var s of sessions){
+          var sActive=state.selection&&state.selection.type==='session'&&state.selection.room===room&&state.selection.player===player&&state.selection.session===s.session?'active':'';
+          html+='<button class="tree-session '+sActive+'" onclick="selectSession(\''+esc(room)+'\',\''+esc(player)+'\',\''+esc(s.session)+'\')">'+esc(s.session)+'<span class="tree-session-count">'+s.count+'</span></button>';
+        }
+        html+='</div>';
+      }
+    }
+    html+='</div>';
+  }
+  document.getElementById('sidebar').innerHTML=html;
+}
+
+function getEntries(){
+  if(!state.selection) return [];
+  var s=state.selection;
+  if(s.type==='server') return serverLogData;
+  if(s.type==='session'){
+    return (allLogs[s.room]&&allLogs[s.room][s.player]&&allLogs[s.room][s.player][s.session])||[];
+  }
+  if(s.type==='player'){
+    var all=allLogs[s.room]&&allLogs[s.room][s.player]||{};
+    var combined=[];
+    for(var sess of Object.keys(all)) combined=combined.concat(all[sess]);
+    combined.sort(function(a,b){return a.t-b.t;});
+    return combined;
+  }
+  return [];
+}
+
+function filterEntries(entries){
+  var search=state.search.toLowerCase();
+  return entries.filter(function(e){
+    if(state.filters[e.cat]===false) return false;
+    if(search){
+      var txt=(e.msg||'')+(e.data||'')+(e.cat||'');
+      if(txt.toLowerCase().indexOf(search)<0) return false;
+    }
+    return true;
+  });
+}
+
+function renderLogArea(){
+  var main=document.getElementById('logMain');
+  if(!state.selection){
+    main.innerHTML='<div class="no-selection">Select a player or session from the sidebar</div>';
+    return;
+  }
+  var s=state.selection;
+  var title=s.type==='server'?'Server Events':
+    s.type==='session'?(s.player+' / '+s.session):
+    (s.player+' (all sessions)');
+
+  var cats=Object.keys(state.filters);
+  var filterBtns=cats.map(function(c){
+    var on=state.filters[c]!==false;
+    return '<span class="log-filter '+(on?'on':'off')+' lf-'+c+'" onclick="toggleFilter(\''+c+'\')">'+c+'</span>';
+  }).join('');
+
+  var entries=getEntries();
+  var filtered=filterEntries(entries);
+
+  var copyLabel=s.type==='server'?'Copy Server Logs':'Copy Room Logs';
+  var dlLabel=s.type==='server'?'Download Server':'Download Room';
+  var html='<div class="log-toolbar">'+
+    '<span class="log-toolbar-title">'+esc(title)+'</span>'+
+    '<button class="copy-btn" onclick="copyAllLogs()">&#x1F4CB; '+copyLabel+'</button>'+
+    '<button class="dl-btn" onclick="downloadAllLogs()">&#x2B07; '+dlLabel+'</button>'+
+    '<button class="auto-scroll-btn '+(state.autoScroll?'on':'')+'" onclick="toggleAutoScroll()">Auto-scroll '+(state.autoScroll?'ON':'OFF')+'</button>'+
+    '</div>'+
+    '<div class="log-toolbar" style="padding-top:6px;padding-bottom:6px">'+
+    '<div class="filter-row">'+filterBtns+'</div>'+
+    '<input class="search-box" placeholder="Search..." value="'+esc(state.search)+'" oninput="setSearch(this.value)">'+
+    '<span class="log-count-badge">'+filtered.length+'/'+entries.length+'</span>'+
+    '</div>'+
+    '<div class="log-body" id="logBody">';
+
+  if(filtered.length===0){
+    html+='<div class="empty-log">No log entries match the current filters.</div>';
+  } else {
+    for(var i=0;i<filtered.length;i++){
+      var e=filtered[i];
+      var rowId='row_'+i;
+      var isErr=e.cat==='ERROR';
+      html+='<div class="log-entry'+(isErr?' err':'')+'">'+
+        '<span class="log-ts">'+formatTs(e.t)+'</span>'+
+        '<span class="log-cat-badge '+catClass(e.cat)+'">'+esc(e.cat)+'</span>'+
+        '<span class="log-msg">'+esc(e.msg)+'</span>';
+      if(e.data){
+        var expanded=!!state.expandedRows[rowId];
+        html+='<span class="log-data-toggle" onclick="toggleData(\''+rowId+'\')">'+(expanded?'[-]':'[+]')+'</span>';
+      }
+      html+='</div>';
+      if(e.data && state.expandedRows[rowId]){
+        html+='<div class="log-data-row">'+esc(typeof e.data==='object'&&e.data!==null?JSON.stringify(e.data,null,2):String(e.data))+'</div>';
+      }
+    }
+  }
+  html+='</div>';
+
+  var scrollTop=lastScrollPos;
+  main.innerHTML=html;
+  var body=document.getElementById('logBody');
+  if(body){
+    if(state.autoScroll){
+      body.scrollTop=body.scrollHeight;
+    } else {
+      body.scrollTop=scrollTop;
+    }
+    body.addEventListener('scroll',function(){
+      if(!state.autoScroll) lastScrollPos=body.scrollTop;
+    });
+  }
+}
+
+// Interaction handlers
+window.toggleRoom=function(room){state.expanded[room]=state.expanded[room]===false?undefined:false;renderSidebar();};
+window.selectServer=function(){state.selection={type:'server'};lastScrollPos=0;renderSidebar();renderLogArea();};
+window.selectPlayer=function(room,player){state.selection={type:'player',room,player};lastScrollPos=0;renderSidebar();renderLogArea();};
+window.selectSession=function(room,player,session){state.selection={type:'session',room,player,session};lastScrollPos=0;renderSidebar();renderLogArea();};
+window.toggleFilter=function(cat){state.filters[cat]=state.filters[cat]===false?true:false;renderLogArea();};
+window.setSearch=function(v){state.search=v;renderLogArea();};
+window.toggleAutoScroll=function(){state.autoScroll=!state.autoScroll;renderLogArea();};
+window.toggleData=function(rowId){state.expandedRows[rowId]=!state.expandedRows[rowId];renderLogArea();};
+
+function buildAllLogsText(){
+  var lines=['=== CrabInventorySync Log Export ===','Exported: '+new Date().toLocaleString(),''];
+  var s=state.selection;
+  var room=s&&s.room;
+  if(serverLogData.length>0){
+    lines.push('=== SERVER LOGS ('+serverLogData.length+' entries) ===');
+    for(var i=0;i<serverLogData.length;i++){
+      var e=serverLogData[i];
+      var line=formatTs(e.t)+' ['+e.cat+'] '+e.msg;
+      if(e.data) line+=' | '+JSON.stringify(e.data);
+      lines.push(line);
+    }
+    lines.push('');
+  }
+  if(room&&allLogs[room]){
+    var players=Object.keys(allLogs[room]).sort();
+    for(var pi=0;pi<players.length;pi++){
+      var player=players[pi];
+      var sessions=Object.keys(allLogs[room][player]).sort();
+      for(var si=0;si<sessions.length;si++){
+        var session=sessions[si];
+        var entries=allLogs[room][player][session];
+        lines.push('=== PLAYER: '+player+' / Session: '+session+' ('+entries.length+' entries) ===');
+        for(var ei=0;ei<entries.length;ei++){
+          var e2=entries[ei];
+          var line2=formatTs(e2.t)+' ['+e2.cat+'] '+e2.msg;
+          if(e2.data) line2+=' | '+e2.data;
+          lines.push(line2);
+        }
+        lines.push('');
+      }
+    }
+  }
+  return lines.join('\n');
+}
+function fallbackCopy(text){
+  var ta=document.createElement('textarea');
+  ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+  document.body.removeChild(ta);
+}
+window.copyAllLogs=function(){
+  var text=buildAllLogsText();
+  var btn=document.querySelector('.copy-btn');
+  function done(){if(btn){var old=btn.textContent;btn.textContent='\u2713 Copied!';setTimeout(function(){btn.textContent=old;},1500);}}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(function(){fallbackCopy(text);done();});
+  } else { fallbackCopy(text); done(); }
+};
+window.downloadAllLogs=function(){
+  var text=buildAllLogsText();
+  var s=state.selection;
+  var room=s&&s.room?s.room:'server';
+  var ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+  var filename='crabsync-'+room+'-'+ts+'.txt';
+  var blob=new Blob([text],{type:'text/plain'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');
+  a.href=url; a.download=filename; a.click();
+  URL.revokeObjectURL(url);
+};
+
+fetchAll();
+setInterval(fetchAll,3000);
+</script>
+</body>
+</html>`;
+
+app.get('/log-viewer', (req, res) => res.setHeader('Content-Type', 'text/html').send(LOG_VIEWER_HTML));
+
 app.listen(PORT, () => {
-    console.log(`CrabInventorySync REST server running on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
+    srvLog('INIT', `Server started on port ${PORT}`);
     console.log(`Dashboard:    http://localhost:${PORT}/`);
 });

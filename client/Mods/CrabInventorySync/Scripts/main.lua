@@ -104,7 +104,15 @@ end
 -- JSON HELPERS
 -- ============================================================
 local function jsonStr(s)
-    return '"' .. tostring(s):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+    return '"' .. tostring(s)
+        :gsub('\\', '\\\\')
+        :gsub('"',  '\\"')
+        :gsub('\n', '\\n')
+        :gsub('\r', '\\r')
+        :gsub('\t', '\\t')
+        :gsub('\b', '\\b')
+        :gsub('\f', '\\f')
+        .. '"'
 end
 
 local function jsonStrArray(arr)
@@ -113,59 +121,109 @@ local function jsonStrArray(arr)
     return "[" .. table.concat(parts, ",") .. "]"
 end
 
+-- Encode an array of inventory items as JSON objects {n,l,a}.
+-- n = DA name, l = level (ByteProperty, 1-255), a = AccumulatedBuff (float).
+-- This is the new payload format for weaponMods/abilityMods/meleeMods/perks/relics.
+local function jsonItemArray(items)
+    local parts = {}
+    for _, item in ipairs(items) do
+        table.insert(parts, string.format('{"n":%s,"l":%d,"a":%.4f}',
+            jsonStr(item.name or ""),
+            math.max(1, math.floor(tonumber(item.level) or 1)),
+            tonumber(item.accum) or 0.0))
+    end
+    return "[" .. table.concat(parts, ",") .. "]"
+end
+
+-- Decode an array of inventory items from the JSON produced by jsonItemArray.
+-- Also accepts the legacy flat-string format ["name1","name2"] for backward compat.
+local function parseItemArray(json, key)
+    local t = {}
+    -- Locate the array value for this key.
+    local keyPat = '"' .. key .. '"%s*:%s*'
+    local ks = json:find(keyPat)
+    if not ks then return t end
+    local arrayOpen = json:find('%[', ks)
+    if not arrayOpen then return t end
+    -- Peek at first non-whitespace character after '[' to detect format.
+    local firstChar = json:match('^%s*(.)', arrayOpen + 1)
+    if firstChar == '{' then
+        -- New format: [{...},{...}]
+        local pos = arrayOpen + 1
+        while true do
+            local closeBracket = json:find('%]', pos)
+            local objS = json:find('{', pos)
+            if not objS or (closeBracket and closeBracket < objS) then break end
+            local objE = json:find('}', objS)
+            if not objE then break end
+            local obj = json:sub(objS, objE)
+            local name  = obj:match('"n"%s*:%s*"([^"]*)"')
+            local level = tonumber(obj:match('"l"%s*:%s*(%d+)'))   or 1
+            local accum = tonumber(obj:match('"a"%s*:%s*(%-?[%d%.]+)')) or 0.0
+            if name and name ~= "" then
+                table.insert(t, { name=name, level=level, accum=accum })
+            end
+            pos = objE + 1
+        end
+    else
+        -- Legacy format: ["name1","name2"]
+        local raw = json:match('"' .. key .. '"%s*:%s*(%[[^%]]*%])')
+        if raw then
+            for name in raw:gmatch('"([^"]*)"') do
+                table.insert(t, { name=name, level=1, accum=0.0 })
+            end
+        end
+    end
+    return t
+end
+
 local function encodeInventory(inv)
     local sl = inv.slots or { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     return string.format(
-        '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,"health":%.3f,"maxHealth":%.3f,' ..
+        '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,' ..
+        '"health":%.3f,"maxHealth":%.3f,' ..
         '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s,' ..
         '"slots":{"weaponMods":%d,"abilityMods":%d,"meleeMods":%d,"perks":%d}}',
         jsonStr(inv.weapon),
         jsonStr(inv.ability),
         jsonStr(inv.melee),
         math.floor(tonumber(inv.crystals) or 0),
-        tonumber(inv.health) or 0.0,
+        tonumber(inv.health)    or 0.0,
         tonumber(inv.maxHealth) or 0.0,
-        jsonStrArray(inv.weaponMods),
-        jsonStrArray(inv.abilityMods),
-        jsonStrArray(inv.meleeMods),
-        jsonStrArray(inv.perks),
-        jsonStrArray(inv.relics),
+        jsonItemArray(inv.weaponMods),
+        jsonItemArray(inv.abilityMods),
+        jsonItemArray(inv.meleeMods),
+        jsonItemArray(inv.perks),
+        jsonItemArray(inv.relics),
         math.floor(tonumber(sl.weaponMods) or 0),
         math.floor(tonumber(sl.abilityMods) or 0),
-        math.floor(tonumber(sl.meleeMods) or 0),
-        math.floor(tonumber(sl.perks) or 0)
+        math.floor(tonumber(sl.meleeMods)  or 0),
+        math.floor(tonumber(sl.perks)      or 0)
     )
 end
 
 -- Minimal JSON decoder for the specific inventory structure we produce.
--- Only handles flat string/number fields and arrays of strings.
+-- Handles both the new item-object format and the legacy flat-string format.
 local function decodeInventory(json)
     if not json or json == "" then return nil end
     -- Strip UTF-8 BOM (0xEF 0xBB 0xBF) if present — PowerShell 5 may write it.
     if json:sub(1,3) == "\xEF\xBB\xBF" then json = json:sub(4) end
     if json:sub(1,1) ~= "{" then return nil end
     local inv = {}
-    inv.weapon   = json:match('"weapon"%s*:%s*"([^"]*)"')   or ""
-    inv.ability  = json:match('"ability"%s*:%s*"([^"]*)"')  or ""
-    inv.melee    = json:match('"melee"%s*:%s*"([^"]*)"')    or ""
-    inv.crystals   = tonumber(json:match('"crystals"%s*:%s*(%d+)')) or 0
-    inv.health     = tonumber(json:match('"health"%s*:%s*(%-?[%d%.]+)')) or 0.0
-    inv.maxHealth  = tonumber(json:match('"maxHealth"%s*:%s*(%-?[%d%.]+)')) or 0.0
+    inv.weapon    = json:match('"weapon"%s*:%s*"([^"]*)"')  or ""
+    inv.ability   = json:match('"ability"%s*:%s*"([^"]*)"') or ""
+    inv.melee     = json:match('"melee"%s*:%s*"([^"]*)"')   or ""
+    inv.crystals  = tonumber(json:match('"crystals"%s*:%s*(%d+)'))          or 0
+    inv.health    = tonumber(json:match('"health"%s*:%s*(%-?[%d%.]+)'))     or 0.0
+    inv.maxHealth = tonumber(json:match('"maxHealth"%s*:%s*(%-?[%d%.]+)'))  or 0.0
 
-    local function strArray(j, key)
-        local t = {}
-        local s = j:match('"' .. key .. '"%s*:%s*(%[[^%]]*%])')
-        if s then for item in s:gmatch('"([^"]*)"') do table.insert(t, item) end end
-        return t
-    end
+    inv.weaponMods  = parseItemArray(json, "weaponMods")
+    inv.abilityMods = parseItemArray(json, "abilityMods")
+    inv.meleeMods   = parseItemArray(json, "meleeMods")
+    inv.perks       = parseItemArray(json, "perks")
+    inv.relics      = parseItemArray(json, "relics")
 
-    inv.weaponMods  = strArray(json, "weaponMods")
-    inv.abilityMods = strArray(json, "abilityMods")
-    inv.meleeMods   = strArray(json, "meleeMods")
-    inv.perks       = strArray(json, "perks")
-    inv.relics      = strArray(json, "relics")
-
-    -- Parse slots sub-object: "slots":{"weaponMods":N,"abilityMods":N,"meleeMods":N,"perks":N}
+    -- Parse slots sub-object.
     local slotsBlock = json:match('"slots"%s*:%s*(%b{})')
     inv.slots = {
         weaponMods  = tonumber(slotsBlock and slotsBlock:match('"weaponMods"%s*:%s*(%d+)'))  or 0,
@@ -221,116 +279,47 @@ local function computeSlotCounts(ps, propName, daField)
     return counts
 end
 
--- ============================================================
--- SESSION ROOM DETECTION
--- ============================================================
--- All players in the same listen-server session share the same replicated
--- GameState.PlayerArray.  Index 0 is always the host (the player who started
--- the game / owns the listen server).  Using the host's name as the room code
--- means every client automatically derives the same room without any manual
--- configuration — joining the same Steam session is sufficient.
-local function detectRoomCode()
-    -- Try game-specific GameState class first, fall back to engine base class.
-    local gs = FindFirstOf("CrabGS")
-    if not gs then
-        local ok, v = pcall(FindFirstOf, "GameStateBase")
-        if ok and v then gs = v end
-    end
-    if not gs then return nil end
-    local okv = pcall(function() return gs:IsValid() end)
-    if not okv then return nil end
-
-    local hostName = nil
+-- Read all mod/perk/relic slots on ps and return a sorted array of item objects
+-- { name=string, level=int, accum=float }.
+-- Reads InventoryInfo.Level and InventoryInfo.AccumulatedBuff directly from each
+-- TArray struct element so the push payload includes per-item level data.
+local function readItemArray(ps, propName, daField)
+    local items = {}
     pcall(function()
-        local arr = gs:GetPropertyValue("PlayerArray")
-        if not arr then return end
-        arr:ForEach(function(idx, elem)
-            if idx == 0 and elem:get():IsValid() then
-                hostName = getPlayerName(elem:get())
-            end
-        end)
-    end)
-
-    if not hostName or hostName == "" or hostName == "UnknownPlayer" then
-        return nil
-    end
-    -- Sanitize: lowercase, collapse anything that isn't alphanumeric/dash to
-    -- underscores, cap at 32 chars so room codes stay readable in server logs.
-    return hostName:gsub("[^%w%-]", "_"):lower():sub(1, 32)
-end
-
--- Returns a flat array of all player name strings currently in GameState.PlayerArray.
--- Used to tell the server who belongs in this room's merge.
-local function getSessionPlayers()
-    local names = {}
-    local gs = FindFirstOf("CrabGS")
-    if not gs then
-        local ok, v = pcall(FindFirstOf, "GameStateBase")
-        if ok and v then gs = v end
-    end
-    if not gs then return names end
-    local okv = pcall(function() return gs:IsValid() end)
-    if not okv then return names end
-    pcall(function()
-        local arr = gs:GetPropertyValue("PlayerArray")
+        local arr = ps:GetPropertyValue(propName)
         if not arr then return end
         arr:ForEach(function(_, elem)
-            local ok, v = pcall(function() return elem:get():IsValid() end)
-            if ok and v then
-                local n = getPlayerName(elem:get())
-                if n and n ~= "" and n ~= "UnknownPlayer" then
-                    table.insert(names, n)
+            if not elem:get():IsValid() then return end
+            local okda, da = pcall(function() return elem:get()[daField] end)
+            if not okda or not da then return end
+            local name = getDAName(da)
+            if name == "" then return end
+            local level, accum = 1, 0.0
+            pcall(function()
+                local info = elem:get().InventoryInfo
+                if info then
+                    level = math.max(1, math.floor(tonumber(info.Level) or 1))
+                    accum = tonumber(info.AccumulatedBuff) or 0.0
                 end
-            end
+            end)
+            table.insert(items, { name=name, level=level, accum=accum })
         end)
     end)
-    return names
+    -- Sort by name so the encoded JSON is deterministic regardless of TArray order.
+    table.sort(items, function(a, b) return a.name < b.name end)
+    return items
+end
+
+-- Returns an empty array — the server merges all active players in the room.
+-- (Previously returned display names via getPlayerName/shellRead, which spawned
+-- a cmd.exe process for every player every 500 ms and crashed the bridge.)
+local function getSessionPlayers()
+    return {}
 end
 
 -- ============================================================
 -- PLAYER STATE HELPERS
 -- ============================================================
-
--- Returns true only if a string looks like a real readable name.
--- Garbled UTF-16LE leakage always contains null bytes (0x00 every other byte
--- for ASCII chars), so a null-byte check catches the exact failure mode here.
-local function isReadable(s)
-    if type(s) ~= "string" or #s == 0 or #s > 64 then return false end
-    return not s:find('\0', 1, true)
-end
-
--- Run a shell command and return its trimmed stdout, or nil on failure.
-local function shellRead(cmd)
-    local ok, handle = pcall(io.popen, cmd)
-    if not ok or not handle then return nil end
-    local out = handle:read("*a")
-    handle:close()
-    if out then out = out:gsub("[%s\r\n]+$", ""):gsub("^[%s\r\n]+", "") end
-    return (out and out ~= "") and out or nil
-end
-
--- Attempt to get a readable player name, working through four strategies.
--- See previous comments in git history for full rationale.
-local function getPlayerName(ps)
-    if ps then
-        local ok1, v1 = pcall(function() return ps:GetPropertyValue("PlayerNamePrivate") end)
-        if ok1 and isReadable(v1) then return v1 end
-
-        local ok2, v2 = pcall(function()
-            local fn = ps:GetPlayerName()
-            return (type(fn) == "string") and fn or nil
-        end)
-        if ok2 and isReadable(v2) then return v2 end
-    end
-
-    local u = shellRead("echo %USERNAME%")
-    if u and u ~= "%USERNAME%" and isReadable(u) then return u end
-
-    local h = shellRead("hostname")
-    if isReadable(h) then return h end
-
-    return "UnknownPlayer"
-end
 
 local function getLocalPS()
     local pc = FindFirstOf("CrabPC")
@@ -385,10 +374,45 @@ local function getLocalHC()
     return nil
 end
 
--- Mod/perk/relic delta-tracking state — declared here so readInventory and
--- applyInventory (defined below) close over these locals correctly.
-local ownModCounts      = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil, relics=nil }
-local lastGameModCounts = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil, relics=nil }
+-- No per-mod delta state needed — mod arrays use MAX merge on the server,
+-- so pushing the full current slot contents is safe (no feedback loop).
+
+-- ============================================================
+-- SET-COMPARISON HELPERS
+-- ============================================================
+-- Compare two sorted string arrays element-by-element.
+-- Used to detect whether a recv payload would actually change the set of mods
+-- in a given slot array, vs. merely reflecting UE4 TArray internal reordering.
+-- IMPORTANT: both arrays must already be sorted before calling this.
+local function arraysEqual(a, b)
+    if #a ~= #b then return false end
+    for i = 1, #a do
+        if a[i] ~= b[i] then return false end
+    end
+    return true
+end
+
+-- Return the sorted list of DA names currently stored in a TArray on ps.
+-- Used by applyInventory to compare the live game state against the recv payload
+-- without being fooled by TArray reordering (which is not a real inventory change).
+local function getSortedNamesFromPS(ps, propName, daField)
+    local names = {}
+    pcall(function()
+        local arr = ps:GetPropertyValue(propName)
+        if not arr then return end
+        arr:ForEach(function(_, elem)
+            if elem:get():IsValid() then
+                local ok, da = pcall(function() return elem:get()[daField] end)
+                if ok and da then
+                    local name = getDAName(da)
+                    if name ~= "" then table.insert(names, name) end
+                end
+            end
+        end)
+    end)
+    table.sort(names)
+    return names
+end
 
 -- Weapon/ability/melee debounce state.
 -- The game briefly reports a stale ability during ability use (e.g. Black Hole → Grappling
@@ -396,7 +420,9 @@ local lastGameModCounts = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perk
 -- after SLOT_STABLE_TICKS consecutive identical reads, so that flicker never reaches push.json.
 -- After an apply the state is anchored so the applied value is not immediately treated as
 -- a new change and pushed back (which would start the receive → push → receive loop).
-local SLOT_STABLE_TICKS = 3   -- 3 × POLL_INTERVAL_MS = 1.5 s debounce window
+local SLOT_STABLE_TICKS = 4   -- 4 × POLL_INTERVAL_MS = 2.0 s debounce window
+                              -- (3 was enough for ability flicker; 4 covers the
+                              --  1-2 tick stale-weapon-DA read during chest interaction)
 local pendingWeapon  = nil;  local pendingWCount = 0;  local stableWeapon  = nil
 local pendingAbility = nil;  local pendingACount = 0;  local stableAbility = nil
 local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
@@ -406,13 +432,14 @@ local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 -- ============================================================
 local function readInventory(ps)
     local inv = {
-        weapon = "", ability = "", melee = "", crystals = 0, health = 0, maxHealth = 0,
+        weapon = "", ability = "", melee = "",
+        crystals = 0, keys = 0, health = 0, maxHealth = 0,
         weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {},
         slots = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     }
     if not ps then return inv end
-    local okv = pcall(function() return ps:IsValid() end)
-    if not okv then return inv end
+    local okv, valid = pcall(function() return ps:IsValid() end)
+    if not okv or not valid then return inv end
 
     -- Debounced reads for weapon/ability/melee.  A value must be identical for
     -- SLOT_STABLE_TICKS consecutive polls before it is reported in the push payload.
@@ -481,24 +508,73 @@ local function readInventory(ps)
             local hi = hc:GetPropertyValue("HealthInfo")
             if not hi then return end
             -- HealthInfo is a struct — direct field access only (no GetPropertyValue).
+            -- Field names from object dump §5 (CrabHealthInfo):
+            --   0x0C  CurrentHealth     — the real live HP value
+            --   0x10  CurrentMaxHealth  — effective max HP (BaseMaxHealth × MaxHealthMultiplier)
+            -- NOTE: there is NO field named "MaxHealth" on CrabHealthInfo.
+            -- Delta-track current HP.
             local raw = hi.CurrentHealth
-            if not raw or raw <= 0 or raw >= 9999 then return end
-            if lastGameHealth == nil then
-                ownHealth      = raw
-                lastGameHealth = raw
-            else
-                local delta = raw - lastGameHealth
-                ownHealth      = math.max(0, (ownHealth or 0) + delta)
-                lastGameHealth = raw
+            if raw and raw > 0 then
+                if lastGameHealth == nil then
+                    ownHealth      = raw
+                    lastGameHealth = raw
+                else
+                    local delta  = raw - lastGameHealth
+                    local newOwn = (ownHealth or 0) + delta
+                    if newOwn <= 0 then
+                        -- The negative delta wiped out our entire contribution while the
+                        -- game reports we're still alive (raw > 0).  This is a hard game
+                        -- reset — picking up a weapon in the lobby, a round restart, etc. —
+                        -- NOT gradual damage.  Example: server applied pooled 500 HP, game
+                        -- reset to base 250 on weapon select → delta = −250, newOwn = 0.
+                        -- Re-initialise from current raw so the pool restores on next push.
+                        ownHealth      = raw
+                        lastGameHealth = raw
+                    else
+                        ownHealth      = newOwn
+                        lastGameHealth = raw
+                    end
+                end
+            elseif raw == 0 then
+                -- Player is dead.  Anchor to 0 so that after respawn the positive
+                -- delta (e.g. 250 − 0 = +250) is counted correctly.
+                ownHealth      = 0
+                lastGameHealth = 0
             end
-            inv.health = ownHealth
+            -- Always report the last known contribution (never the 0 default).
+            if ownHealth then inv.health = ownHealth end
+
+            -- Delta-track max HP with the same re-init guard.
+            local maxRaw = hi.CurrentMaxHealth
+            if maxRaw and maxRaw > 0 then
+                if lastGameMaxHealth == nil then
+                    ownMaxHealth      = maxRaw
+                    lastGameMaxHealth = maxRaw
+                else
+                    local maxDelta  = maxRaw - lastGameMaxHealth
+                    local newMaxOwn = (ownMaxHealth or 0) + maxDelta
+                    if newMaxOwn <= 0 then
+                        -- Same re-init logic: game reset maxHP (weapon select, round start).
+                        ownMaxHealth      = maxRaw
+                        lastGameMaxHealth = maxRaw
+                    else
+                        ownMaxHealth      = newMaxOwn
+                        lastGameMaxHealth = maxRaw
+                    end
+                end
+            elseif maxRaw == 0 then
+                ownMaxHealth      = 0
+                lastGameMaxHealth = 0
+            end
+            if ownMaxHealth then inv.maxHealth = ownMaxHealth end
         end)
     end
 
-    -- Delta-track each mod/perk/relic category so we only push items we personally
-    -- earned — same pattern as crystals/health to prevent sync feedback loops.
-    -- ownModCounts[key] holds our personal name→count contribution; synced items
-    -- are anchored into lastGameModCounts after apply so their delta = 0 next tick.
+    -- Read full item data (name + Level + AccumulatedBuff) from each TArray slot.
+    -- readItemArray reads InventoryInfo directly from the struct so Level and
+    -- AccumulatedBuff are captured in the push payload.  Results are sorted by name
+    -- so the JSON is deterministic regardless of UE4 TArray internal ordering —
+    -- this eliminates the false-positive change detection that caused the shuffle bug.
     for _, cat in ipairs({
         { inv="weaponMods",  prop="WeaponMods",  da="WeaponModDA"  },
         { inv="abilityMods", prop="AbilityMods", da="AbilityModDA" },
@@ -506,43 +582,40 @@ local function readInventory(ps)
         { inv="perks",       prop="Perks",       da="PerkDA"       },
         { inv="relics",      prop="Relics",      da="RelicDA"      },
     }) do
-        local current = computeSlotCounts(ps, cat.prop, cat.da)
-        local own  = ownModCounts[cat.inv]
-        local last = lastGameModCounts[cat.inv]
-
-        if own == nil then
-            -- First read after init/reset: everything currently in our slots is ours.
-            own = {}
-            for name, count in pairs(current) do own[name] = count end
-        else
-            -- Only the delta since the last tick changes our contribution.
-            -- Positive delta = earned something; negative = lost/spent something.
-            local allNames = {}
-            for name in pairs(current) do allNames[name] = true end
-            for name in pairs(last)    do allNames[name] = true end
-            for name in pairs(allNames) do
-                local delta = (current[name] or 0) - (last[name] or 0)
-                if delta ~= 0 then
-                    own[name] = math.max(0, (own[name] or 0) + delta)
-                end
-            end
-        end
-
-        ownModCounts[cat.inv]      = own
-        lastGameModCounts[cat.inv] = current  -- anchor to this tick's game state
-
-        -- Expand name→count into the flat string array the JSON encoder expects.
-        -- Duplicate names represent stacked items and are preserved intentionally.
-        for name, count in pairs(own) do
-            for _ = 1, count do table.insert(inv[cat.inv], name) end
-        end
+        inv[cat.inv] = readItemArray(ps, cat.prop, cat.da)
     end
 
+
     if SYNC_SLOTS then
-        pcall(function() inv.slots.weaponMods  = math.floor(tonumber(ps:GetPropertyValue("NumWeaponModSlots"))  or 0) end)
-        pcall(function() inv.slots.abilityMods = math.floor(tonumber(ps:GetPropertyValue("NumAbilityModSlots")) or 0) end)
-        pcall(function() inv.slots.meleeMods   = math.floor(tonumber(ps:GetPropertyValue("NumMeleeModSlots"))   or 0) end)
-        pcall(function() inv.slots.perks       = math.floor(tonumber(ps:GetPropertyValue("NumPerkSlots"))       or 0) end)
+        -- Delta-tracking for slot counts, identical to the crystals / health pattern.
+        -- We report only the slots we personally unlocked so the server can SUM
+        -- contributions from all players without causing a doubling feedback loop.
+        local slotProps = {
+            { key="weaponMods",  prop="NumWeaponModSlots"  },
+            { key="abilityMods", prop="NumAbilityModSlots" },
+            { key="meleeMods",   prop="NumMeleeModSlots"   },
+            { key="perks",       prop="NumPerkSlots"       },
+        }
+        for _, sp in ipairs(slotProps) do
+            pcall(function()
+                local raw = math.floor(tonumber(ps:GetPropertyValue(sp.prop)) or 0)
+                if lastGameSlots[sp.key] == nil then
+                    -- First read: treat everything we see as our own contribution.
+                    ownSlots[sp.key]      = raw
+                    lastGameSlots[sp.key] = raw
+                else
+                    -- Only positive deltas count as earning new slots in-game.
+                    -- Negative deltas (e.g. after a sync write raised the total)
+                    -- are ignored so applied totals don't shrink our contribution.
+                    local delta = raw - lastGameSlots[sp.key]
+                    if delta > 0 then
+                        ownSlots[sp.key] = (ownSlots[sp.key] or 0) + delta
+                    end
+                    lastGameSlots[sp.key] = raw
+                end
+                inv.slots[sp.key] = ownSlots[sp.key]
+            end)
+        end
     end
 
     return inv
@@ -553,8 +626,8 @@ end
 -- ============================================================
 local function applyInventory(ps, inv)
     if not ps or not inv then return end
-    local ok = pcall(function() return ps:IsValid() end)
-    if not ok then return end
+    local ok, valid = pcall(function() return ps:IsValid() end)
+    if not ok or not valid then return end
 
     local weaponDAs     = SYNC_WEAPON        and FindAllOf("CrabWeaponDA")     or {}
     local abilityDAs    = SYNC_ABILITY       and FindAllOf("CrabAbilityDA")    or {}
@@ -622,44 +695,131 @@ local function applyInventory(ps, inv)
     -- delta-tracking in readInventory: after this write, lastGameCrystals is set
     -- to the applied value so the very next readInventory sees delta = 0 and does
     -- NOT add the synced total to ownCrystals again.
+    --
+    -- Guard: only write if the merged total EXCEEDS the current game value.
+    -- Writing a stale lower total silently deletes crystals the player earned
+    -- mid-combat (example: game=200, stale server=150 → apply reduces to 150).
+    -- Exception: current == 0 means fresh load / new run, always apply.
     if SYNC_CRYSTALS and inv.crystals and inv.crystals > 0 then
         pcall(function()
-            local total = math.floor(inv.crystals)
-            ps:SetPropertyValue(CRYSTALS_PROPERTY, total)
-            lastGameCrystals = total   -- keep delta-tracker in sync with what we wrote
+            -- CrabPS.Crystals is UInt32Property (dump §2.1 offset 0x470) — unsigned,
+            -- range 0–4,294,967,295.  A pooled server total from many players could exceed
+            -- that; clamping prevents a wrap-to-near-zero write that would wipe all crystals.
+            local UINT32_MAX = 4294967295
+            local total   = math.min(math.floor(inv.crystals), UINT32_MAX)
+            local current = math.min(math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0), UINT32_MAX)
+            if current == 0 or total > current then
+                ps:SetPropertyValue(CRYSTALS_PROPERTY, total)
+                lastGameCrystals = total   -- keep delta-tracker in sync with what we wrote
+                pcall(function() ps:OnRep_Crystals() end)
+            end
         end)
     end
 
-    if SYNC_HEALTH and inv.health and inv.health > 0 and inv.health < 9999 then
+
+    if SYNC_HEALTH and ((inv.health and inv.health > 0) or (inv.maxHealth and inv.maxHealth > 0)) then
         pcall(function()
             local hc = getLocalHC()
             if not hc then return end
             local hi = hc:GetPropertyValue("HealthInfo")
             if not hi then return end
-            hi.CurrentHealth = inv.health
-            -- Cap the anchor to actual MaxHealth so that if the game clamps the applied
-            -- value (merged > our max), the next delta read is 0, not a large negative
-            -- that zeros out ownHealth and causes health: 0 in future pushes.
-            local maxHp = nil
-            pcall(function() maxHp = hi.MaxHealth end)
-            lastGameHealth = (maxHp and maxHp > 0) and math.min(inv.health, maxHp) or inv.health
-            pcall(function() hc:OnRep_HealthInfo() end)
+
+            local didWrite = false
+
+            -- Apply pooled max HP first so the ceiling is raised before current HP.
+            -- Server SUMs maxHealth across players (same as current HP), so two players
+            -- at 250 maxHP each → everyone gets 500 maxHP applied.
+            -- SetPropertyValue on struct fields bypasses engine clamping, so the game
+            -- stores exactly what we write — the delta tracker sees 0 next tick.
+            local mergedMax = math.floor(tonumber(inv.maxHealth) or 0)
+            if mergedMax > 0 then
+                local currentMax = 0
+                pcall(function() currentMax = math.floor(tonumber(hi.CurrentMaxHealth) or 0) end)
+                if mergedMax > currentMax then
+                    hi.CurrentMaxHealth = mergedMax
+                    lastGameMaxHealth   = mergedMax  -- anchor: next read delta = 0
+                    didWrite = true
+                end
+            end
+
+            -- Apply pooled current HP.
+            -- We do NOT clamp to maxHP — the design is to pool both totals together,
+            -- so 2 × 250 HP players should each see 500/500, not 250/500.
+            local mergedHP = math.floor(tonumber(inv.health) or 0)
+            if mergedHP > 0 then
+                local currentHP = 0
+                pcall(function() currentHP = math.floor(tonumber(hi.CurrentHealth) or 0) end)
+                if mergedHP > currentHP then
+                    hi.CurrentHealth = mergedHP
+                    lastGameHealth   = mergedHP  -- anchor: next read delta = 0
+                    didWrite = true
+                end
+            end
+
+            if didWrite then
+                pcall(function() hc:OnRep_HealthInfo() end)
+            end
         end)
     end
 
+    -- Smart slot writer: two-pass algorithm that PRESERVES slots already holding
+    -- a wanted mod, and only rewrites slots whose current DA is not in the wanted set.
+    --
+    -- Why this matters:
+    --   The old approach wrote sorted-recv sequentially into slots 0,1,2…
+    --   If the server had [ModA,ModB,ModC] and the player had 2 slots [ModA,ModC],
+    --   it would write slot0=ModA, slot1=ModB — silently overwriting ModC with ModB.
+    --   InventoryInfo (Level, Enhancements) lives in the slot struct, so the Level
+    --   for ModC would now be labelled as ModB, destroying the player's earned progress.
+    --
+    --   The two-pass approach:
+    --     Pass 1 — walk slots; if slot's DA is in the wanted set, mark it satisfied
+    --              (leave it entirely untouched — DA, Level, Enhancements, AccumulatedBuff
+    --              all preserved).  Collect slots that hold unwanted DAs.
+    --     Pass 2 — fill the collected "dirty" slots with the mods still unsatisfied
+    --              from the wanted set.  Only dirty slots are ever written.
     local function applySlotArray(propName, daField, daList, sourceNames)
         if #sourceNames == 0 or not daList or #daList == 0 then return end
         pcall(function()
             local arr = ps:GetPropertyValue(propName)
             if not arr then return end
-            local idx = 1
+
+            -- Build a mutable wanted-count map from the recv names.
+            local wanted = {}
+            for _, n in ipairs(sourceNames) do
+                wanted[n] = (wanted[n] or 0) + 1
+            end
+
+            -- Pass 1: identify slots that already satisfy a wanted entry vs. slots
+            -- that hold a DA not in the wanted set (need overwriting).
+            local dirtySlots = {}
             arr:ForEach(function(_, elem)
-                if elem:get():IsValid() and sourceNames[idx] then
-                    local da = findDA(daList, sourceNames[idx])
-                    if da then pcall(function() elem:get()[daField] = da end) end
-                    idx = idx + 1
+                if not elem:get():IsValid() then return end
+                local ok, da = pcall(function() return elem:get()[daField] end)
+                local curName = (ok and da) and getDAName(da) or ""
+                if wanted[curName] and wanted[curName] > 0 then
+                    -- Slot already has a wanted mod.  Mark it satisfied and leave it alone.
+                    wanted[curName] = wanted[curName] - 1
+                else
+                    -- Slot holds a mod not wanted (or unreadable).  Queue for overwrite.
+                    table.insert(dirtySlots, elem:get())
                 end
             end)
+
+            -- Collect the mods still needed (unsatisfied entries in wanted).
+            local modsToPlace = {}
+            for name, count in pairs(wanted) do
+                for _ = 1, count do table.insert(modsToPlace, name) end
+            end
+
+            -- Pass 2: write unsatisfied mods into dirty slots only.
+            -- Slots with correct mods are never touched — their Level and Enhancements
+            -- remain exactly as the game set them.
+            for i, slotElem in ipairs(dirtySlots) do
+                if not modsToPlace[i] then break end  -- no more mods to assign
+                local da = findDA(daList, modsToPlace[i])
+                if da then pcall(function() slotElem[daField] = da end) end
+            end
         end)
     end
 
@@ -667,6 +827,18 @@ local function applyInventory(ps, inv)
     -- readInventory sees delta = 0 for synced items (same technique as crystals/health).
     -- We re-read the actual TArray after writing rather than assuming all items landed,
     -- since applySlotArray silently skips items beyond the player's slot count.
+    --
+    -- SET-BASED GUARD: before each slot write, compare the sorted set of names in
+    -- recv against the sorted set currently in the TArray.  If they are identical
+    -- (i.e. same mods, just a different UE4 TArray order) we skip the write entirely.
+    --
+    -- Why this matters:
+    --   applySlotArray writes recv[1] → slot 0, recv[2] → slot 1, etc.  If TArray
+    --   reordering has shuffled the game's internal order, the write swaps the DA
+    --   pointer in each slot WITHOUT moving the InventoryInfo struct (Level, Enhancements
+    --   live with the slot, not the DA).  Result: mod names rotate between slots while
+    --   their Levels stay behind — the "shuffle" bug.  Skipping the write when the SET
+    --   is unchanged prevents this entirely.
     for _, entry in ipairs({
         { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  da="WeaponModDA",  list=weaponModDAs,  src=inv.weaponMods,  key="weaponMods"  },
         { flag=SYNC_ABILITY_MODS, prop="AbilityMods", da="AbilityModDA", list=abilityModDAs, src=inv.abilityMods, key="abilityMods" },
@@ -675,23 +847,113 @@ local function applyInventory(ps, inv)
         { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      list=relicDAs,      src=inv.relics,      key="relics"      },
     }) do
         if entry.flag then
-            applySlotArray(entry.prop, entry.da, entry.list, entry.src)
-            -- Anchor to what we INTENDED to write, not computeSlotCounts.
-            -- Reading the slot immediately after writing via UE4SS reflection returns
-            -- the pre-write value for that tick (the game hasn't processed it yet).
-            -- Using the stale read as the anchor causes a spurious +delta on the next
-            -- readInventory, which pushes the old mod, triggers another apply, and
-            -- creates the 500 ms Arcane Shot ↔ Ice Shot oscillation seen in the logs.
-            local writtenCounts = {}
-            for _, name in ipairs(entry.src) do
-                writtenCounts[name] = (writtenCounts[name] or 0) + 1
+            -- entry.src is now an array of {name,level,accum} objects.
+            -- Extract sorted names for the set-comparison (we don't want TArray
+            -- reordering to trigger a slot write — only real add/remove changes do).
+            local sortedSrc = {}
+            for _, item in ipairs(entry.src) do table.insert(sortedSrc, item.name) end
+            table.sort(sortedSrc)
+            local gameSorted = getSortedNamesFromPS(ps, entry.prop, entry.da)
+            -- Membership check: only write if a mod currently in-game is missing from
+            -- recv. If recv merely has MORE mods than slots can hold (e.g. 2-player pool
+            -- has 2 mods but this player only has 1 slot), that is expected — do NOT
+            -- rewrite, otherwise the guard fires every tick and never settles.
+            local recvSet = {}
+            for _, name in ipairs(sortedSrc) do recvSet[name] = true end
+            local missingInRecv = false
+            for _, name in ipairs(gameSorted) do
+                if not recvSet[name] then
+                    missingInRecv = true
+                    break
+                end
             end
-            lastGameModCounts[entry.key] = writtenCounts
+            -- Also write if recv has something new AND the game slot is empty/short
+            -- (i.e. game has fewer unique mods than recv, meaning there's room to add).
+            local gameSet = {}
+            for _, name in ipairs(gameSorted) do gameSet[name] = true end
+            local newInRecv = false
+            for _, name in ipairs(sortedSrc) do
+                if not gameSet[name] then
+                    newInRecv = true
+                    break
+                end
+            end
+            if missingInRecv or newInRecv then
+                print(string.format("[CrabSync:apply] %s set changed (%d game / %d recv) — writing slots\n",
+                    entry.prop, #gameSorted, #sortedSrc))
+                -- applySlotArray expects a flat name list for its wanted-set logic.
+                local srcNames = sortedSrc  -- already extracted above
+                applySlotArray(entry.prop, entry.da, entry.list, srcNames)
+            end
         end
     end
 
+    -- Level + AccumulatedBuff upgrade pass.
+    -- Runs over every slot regardless of whether applySlotArray wrote to it.
+    -- If the server has a higher Level for a mod the player already owns
+    -- (earned by another player picking up duplicates), we write it here.
+    -- We NEVER downgrade — only take the max.
+    --
+    -- Note: Enhancements (Anvil upgrades, nested TArray<enum>) are not written
+    -- here because growing a nested TArray inside a struct inside a TArray is
+    -- not safely supported by UE4SS. They are pushed/pulled in the payload for
+    -- future use once a safe write path is confirmed.
+    local function applyInventoryInfo(propName, daField, srcItems)
+        -- Build a lookup: name → {level, accum}
+        local recvInfo = {}
+        for _, item in ipairs(srcItems) do
+            recvInfo[item.name] = item
+        end
+        pcall(function()
+            local arr = ps:GetPropertyValue(propName)
+            if not arr then return end
+            arr:ForEach(function(_, elem)
+                if not elem:get():IsValid() then return end
+                local okda, da = pcall(function() return elem:get()[daField] end)
+                if not okda or not da then return end
+                local name = getDAName(da)
+                local wanted = recvInfo[name]
+                if not wanted then return end
+                pcall(function()
+                    local info = elem:get().InventoryInfo
+                    if not info then return end
+                    -- Level: only upgrade, never downgrade.
+                    -- CrabInventoryInfo.Level is ByteProperty (0-255); clamp to
+                    -- prevent wrap-around that would reset progress to 0.
+                    local curLevel    = math.floor(tonumber(info.Level) or 1)
+                    local wantedLevel = math.min(255, math.floor(tonumber(wanted.level) or 1))
+                    if wantedLevel > curLevel then
+                        info.Level = wantedLevel
+                    end
+                    -- AccumulatedBuff: take the max (relics accumulate over time).
+                    local curAccum    = tonumber(info.AccumulatedBuff) or 0.0
+                    local wantedAccum = tonumber(wanted.accum)         or 0.0
+                    if wantedAccum > curAccum then
+                        info.AccumulatedBuff = wantedAccum
+                    end
+                end)
+            end)
+        end)
+    end
+
+    for _, entry in ipairs({
+        { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  da="WeaponModDA",  src=inv.weaponMods  },
+        { flag=SYNC_ABILITY_MODS, prop="AbilityMods", da="AbilityModDA", src=inv.abilityMods },
+        { flag=SYNC_MELEE_MODS,   prop="MeleeMods",   da="MeleeModDA",   src=inv.meleeMods   },
+        { flag=SYNC_PERKS,        prop="Perks",       da="PerkDA",       src=inv.perks       },
+        { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      src=inv.relics      },
+    }) do
+        if entry.flag then applyInventoryInfo(entry.prop, entry.da, entry.src) end
+    end
+
+    -- Notify the game that inventory changed so UI slots and mod-effect systems
+    -- recalculate immediately rather than waiting for the next replication cycle.
+    pcall(function() ps:OnRep_Inventory() end)
+
     -- Apply slot counts from the merged payload.  Only increase — never decrease.
     -- Uses SetPropertyValue (reflection write) only; no UFunction calls.
+    -- All NumXxxSlots properties are ByteProperty (0-255); clamp to prevent
+    -- wrap-around that would reset slot count to 0.
     if SYNC_SLOTS and inv.slots then
         for _, entry in ipairs({
             { prop="NumWeaponModSlots",  key="weaponMods"  },
@@ -699,12 +961,16 @@ local function applyInventory(ps, inv)
             { prop="NumMeleeModSlots",   key="meleeMods"   },
             { prop="NumPerkSlots",       key="perks"       },
         }) do
-            local incoming = math.floor(tonumber(inv.slots[entry.key]) or 0)
+            local incoming = math.min(255, math.floor(tonumber(inv.slots[entry.key]) or 0))
             if incoming > 0 then
                 pcall(function()
                     local current = math.floor(tonumber(ps:GetPropertyValue(entry.prop)) or 0)
                     if incoming > current then
                         ps:SetPropertyValue(entry.prop, incoming)
+                        -- Anchor the delta tracker to what we just wrote so the very next
+                        -- readInventory tick sees delta = 0 and does NOT add the synced
+                        -- total to ownSlots again (same pattern as crystals / health).
+                        lastGameSlots[entry.key] = incoming
                     end
                 end)
             end
@@ -791,7 +1057,6 @@ local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
 local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
 local lastRecvJson    = ""     -- JSON we last applied from recv.json
 local isTransitioning = false  -- pauses polling during level transitions
-local currentRoomCode = nil    -- detected from GameState.PlayerArray[0]; nil = not yet detected
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
 
@@ -815,27 +1080,33 @@ local lastGameCrystals = nil   -- raw game crystal count at the last read or app
 local ownHealth      = nil   -- our HP contribution (nil = not yet set)
 local lastGameHealth = nil   -- raw game HP at the last read or apply
 
+-- Same delta-tracking pattern for max HP.
+-- ownMaxHealth      : our personal CurrentMaxHealth contribution.
+-- lastGameMaxHealth : raw game CurrentMaxHealth at last read or apply.
+-- Server SUMs maxHealth across players just like current HP, so two players
+-- each at 250 maxHP → merged 500 maxHP applied to everyone.
+local ownMaxHealth      = nil
+local lastGameMaxHealth = nil
+
+-- Same delta-tracking pattern for slot counts.
+-- Each slot key (weaponMods, abilityMods, meleeMods, perks) is tracked independently.
+-- ownSlots[k]      = how many slots of type k we personally contributed.
+-- lastGameSlots[k] = raw game slot count at last read or apply (nil = not yet initialised).
+-- The server SUMs contributions from all players, so we must send only our delta,
+-- not the already-synced total (which would cause doubling on every subsequent push).
+local ownSlots      = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
+local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil }
+
+
 
 -- Write push.json only when the inventory has actually changed.
 -- The file is written as {"room":"...","inventory":{...}} so the bridge can
--- automatically use the correct room for both push POSTs and sync GETs without
--- any manual config — the room is derived from GameState.PlayerArray[0] (the host).
+-- use the correct room for both push POSTs and sync GETs.
+-- Room code comes from config.txt (ROOM_CODE).
 local function pushIfChanged()
     if isTransitioning then return end
     local ps = getLocalPS()
     if not ps then return end
-
-    -- Try GameState-based room detection every tick until it succeeds.
-    -- Once set, stop retrying — avoids any per-tick overhead.
-    -- Reset to nil on level transition so re-detection fires in the new level.
-    if not currentRoomCode then
-        local detected = detectRoomCode()
-        if detected then
-            currentRoomCode = detected
-            print("[CrabInventorySync] Room: " .. currentRoomCode .. "\n")
-        end
-    end
-    local roomForPush = currentRoomCode or ROOM_CODE
 
     local invJson = encodeInventory(readInventory(ps))
     -- Always log the push evaluation so we can see debounce-stable vs last-pushed.
@@ -848,7 +1119,7 @@ local function pushIfChanged()
     -- Wrap inventory with room, session player list, and password.
     local sessionPlayers = getSessionPlayers()
     local playersJson    = jsonStrArray(sessionPlayers)
-    local payload = '{"room":' .. jsonStr(roomForPush) .. ',"players":' .. playersJson .. ',"password":' .. jsonStr(ROOM_PASSWORD) .. ',"inventory":' .. invJson .. '}'
+    local payload = '{"room":' .. jsonStr(ROOM_CODE) .. ',"players":' .. playersJson .. ',"password":' .. jsonStr(ROOM_PASSWORD) .. ',"inventory":' .. invJson .. '}'
     local f = io.open(PUSH_FILE, "w")
     if f then
         f:write(payload)
@@ -891,17 +1162,6 @@ end
 -- HOOKS & KEYBINDS
 -- ============================================================
 loadConfig()
--- One-time player name detection for fallback room code.
--- shellRead (io.popen) is only safe to call here at startup — not inside the 500 ms
--- poll loop, where it would spawn a new cmd.exe process every half-second and flood
--- the system, which was causing the bridge to crash after a single push.
-if ROOM_CODE == "default" then
-    local name = getPlayerName(nil)
-    if name and name ~= "UnknownPlayer" then
-        ROOM_CODE = name:gsub("[^%w%-]", "_"):lower():sub(1, 32)
-        print("[CrabInventorySync] Fallback room: " .. ROOM_CODE .. "\n")
-    end
-end
 autoLaunchBridge()
 
 -- Pause polling for 4 s during level transitions to avoid the 0xe06d7363 crash
@@ -913,18 +1173,13 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
-        currentRoomCode = nil  -- re-detect host from new level's PlayerArray
-        -- Reset delta-trackers so the first read in the new level re-initialises
-        -- cleanly (avoids a large negative delta from the old applied total vs.
-        -- the new level's starting values).
-        ownCrystals      = nil
-        lastGameCrystals = nil
-        ownHealth        = nil
-        lastGameHealth   = nil
-        for _, key in ipairs({"weaponMods","abilityMods","meleeMods","perks","relics"}) do
-            ownModCounts[key]      = nil
-            lastGameModCounts[key] = nil
-        end
+        -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
+        -- ownMaxHealth, ownSlots, lastGame* counters).  The game preserves
+        -- these values across island clears, so resetting them re-initialises
+        -- each player's contribution to the FULL pooled total — doubling the
+        -- pool on every transition.  The existing guards (max(0,...) clamp,
+        -- newOwn<=0 re-init, apply anchoring) already handle genuine game
+        -- resets (lobby, new run) correctly without a nil reset here.
         pendingWeapon  = nil;  pendingWCount = 0;  stableWeapon  = nil
         pendingAbility = nil;  pendingACount = 0;  stableAbility = nil
         pendingMelee   = nil;  pendingMCount = 0;  stableMelee   = nil
@@ -936,15 +1191,9 @@ end)
 RegisterKeyBind(Key.F9, function()
     lastPushedJson   = ""
     lastRecvJson     = ""
-    currentRoomCode  = nil   -- re-detect host on next push tick
-    ownCrystals      = nil   -- re-initialise delta-trackers on next read
-    lastGameCrystals = nil
-    ownHealth        = nil
-    lastGameHealth   = nil
-    for _, key in ipairs({"weaponMods","abilityMods","meleeMods","perks","relics"}) do
-        ownModCounts[key]      = nil
-        lastGameModCounts[key] = nil
-    end
+    -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
+    -- ownMaxHealth, ownSlots).  Resetting them re-initialises each player's
+    -- contribution to the full pooled total, doubling the pool.
     pendingWeapon  = nil;  pendingWCount = 0;  stableWeapon  = nil
     pendingAbility = nil;  pendingACount = 0;  stableAbility = nil
     pendingMelee   = nil;  pendingMCount = 0;  stableMelee   = nil
