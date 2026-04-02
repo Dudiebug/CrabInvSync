@@ -430,8 +430,7 @@ local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 -- Lobby equip path can briefly report CurrentHealth/CurrentMaxHealth as 0 for
 -- 1-2 polls.  Only suppress zero-health reads for a short, equip-triggered window.
 -- This does NOT delay real death outside the equip path.
-local EQUIP_HEALTH_ZERO_GRACE_MS    = 1000
-local EQUIP_HEALTH_ZERO_GRACE_TICKS = 2   -- recalculated from POLL_INTERVAL_MS below
+local EQUIP_HEALTH_ZERO_GRACE_TICKS = 2   -- ticks (recalculated from POLL_INTERVAL_MS below)
 local equipHealthZeroReadsRemaining = 0
 
 -- ============================================================
@@ -1039,7 +1038,7 @@ local function autoLaunchBridge()
         -- Launch PowerShell bridge. windowStyle=1 = normal visible so errors are readable.
         'Dim playerName : playerName = sh.ExpandEnvironmentStrings("%USERNAME%")',
         'sh.CurrentDirectory = bridgeDir',
-        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File """" & bridgePath & """" ""' .. SERVER_URL .. '"" """" & playerName & """"", 1, False',
+        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File """ & bridgePath & """ ""' .. SERVER_URL .. '"" """ & playerName & """", 1, False',
     }
 
     local f = io.open(vbsPath, "w")
@@ -1079,7 +1078,7 @@ end
 -- first tick after the new level loads performs a full fresh sync.
 
 local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
-EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(EQUIP_HEALTH_ZERO_GRACE_MS / POLL_INTERVAL_MS))
+EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(1000 / POLL_INTERVAL_MS))
 
 local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
 local lastRecvJson    = ""     -- raw recv.json text we last read
