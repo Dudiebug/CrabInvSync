@@ -427,6 +427,13 @@ local pendingWeapon  = nil;  local pendingWCount = 0;  local stableWeapon  = nil
 local pendingAbility = nil;  local pendingACount = 0;  local stableAbility = nil
 local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 
+-- Lobby equip path can briefly report CurrentHealth/CurrentMaxHealth as 0 for
+-- 1-2 polls.  Only suppress zero-health reads for a short, equip-triggered window.
+-- This does NOT delay real death outside the equip path.
+local EQUIP_HEALTH_ZERO_GRACE_MS    = 1000
+local EQUIP_HEALTH_ZERO_GRACE_TICKS = 2   -- recalculated from POLL_INTERVAL_MS below
+local equipHealthZeroReadsRemaining = 0
+
 -- ============================================================
 -- INVENTORY READ
 -- ============================================================
@@ -507,10 +514,11 @@ local function readInventory(ps)
             if not hc then return end
             local hi = hc:GetPropertyValue("HealthInfo")
             if not hi then return end
-            -- HealthInfo is a struct — direct field access only (no GetPropertyValue).
-            -- Field names from object dump §5 (CrabHealthInfo):
-            --   0x0C  CurrentHealth     — the real live HP value
-            --   0x10  CurrentMaxHealth  — effective max HP (BaseMaxHealth × MaxHealthMultiplier)
+            local ignoreHealthZeroThisRead = (equipHealthZeroReadsRemaining > 0)
+            -- HealthInfo is a struct: direct field access only (no GetPropertyValue).
+            -- Field names from object dump section 5 (CrabHealthInfo):
+            --   0x0C  CurrentHealth     - the real live HP value
+            --   0x10  CurrentMaxHealth  - effective max HP (BaseMaxHealth * MaxHealthMultiplier)
             -- NOTE: there is NO field named "MaxHealth" on CrabHealthInfo.
             -- Delta-track current HP.
             local raw = hi.CurrentHealth
@@ -522,12 +530,7 @@ local function readInventory(ps)
                     local delta  = raw - lastGameHealth
                     local newOwn = (ownHealth or 0) + delta
                     if newOwn <= 0 then
-                        -- The negative delta wiped out our entire contribution while the
-                        -- game reports we're still alive (raw > 0).  This is a hard game
-                        -- reset — picking up a weapon in the lobby, a round restart, etc. —
-                        -- NOT gradual damage.  Example: server applied pooled 500 HP, game
-                        -- reset to base 250 on weapon select → delta = −250, newOwn = 0.
-                        -- Re-initialise from current raw so the pool restores on next push.
+                        -- Hard reset while alive (weapon select / round reset), not gradual damage.
                         ownHealth      = raw
                         lastGameHealth = raw
                     else
@@ -536,10 +539,13 @@ local function readInventory(ps)
                     end
                 end
             elseif raw == 0 then
-                -- Player is dead.  Anchor to 0 so that after respawn the positive
-                -- delta (e.g. 250 − 0 = +250) is counted correctly.
-                ownHealth      = 0
-                lastGameHealth = 0
+                if ignoreHealthZeroThisRead then
+                    print("[CrabSync:health] Ignoring transient CurrentHealth=0 during lobby-equip grace.\n")
+                else
+                    -- Player is dead. Anchor to 0 so respawn delta is counted correctly.
+                    ownHealth      = 0
+                    lastGameHealth = 0
+                end
             end
             -- Always report the last known contribution (never the 0 default).
             if ownHealth then inv.health = ownHealth end
@@ -554,7 +560,6 @@ local function readInventory(ps)
                     local maxDelta  = maxRaw - lastGameMaxHealth
                     local newMaxOwn = (ownMaxHealth or 0) + maxDelta
                     if newMaxOwn <= 0 then
-                        -- Same re-init logic: game reset maxHP (weapon select, round start).
                         ownMaxHealth      = maxRaw
                         lastGameMaxHealth = maxRaw
                     else
@@ -563,10 +568,17 @@ local function readInventory(ps)
                     end
                 end
             elseif maxRaw == 0 then
-                ownMaxHealth      = 0
-                lastGameMaxHealth = 0
+                if ignoreHealthZeroThisRead then
+                    print("[CrabSync:health] Ignoring transient CurrentMaxHealth=0 during lobby-equip grace.\n")
+                else
+                    ownMaxHealth      = 0
+                    lastGameMaxHealth = 0
+                end
             end
             if ownMaxHealth then inv.maxHealth = ownMaxHealth end
+            if equipHealthZeroReadsRemaining > 0 then
+                equipHealthZeroReadsRemaining = equipHealthZeroReadsRemaining - 1
+            end
         end)
     end
 
@@ -678,6 +690,8 @@ local function applyInventory(ps, inv)
                     "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
                     newWeapon, newAbility, newMelee))
                 ps:ServerEquipInventory(weapon, ability, melee)
+                equipHealthZeroReadsRemaining = EQUIP_HEALTH_ZERO_GRACE_TICKS
+                print(string.format("[CrabSync:health] Equip apply detected - suppressing zero-health reads for %d tick(s).\n", EQUIP_HEALTH_ZERO_GRACE_TICKS))
                 appliedWeapon  = newWeapon
                 appliedAbility = newAbility
                 appliedMelee   = newMelee
@@ -1025,7 +1039,7 @@ local function autoLaunchBridge()
         -- Launch PowerShell bridge. windowStyle=1 = normal visible so errors are readable.
         'Dim playerName : playerName = sh.ExpandEnvironmentStrings("%USERNAME%")',
         'sh.CurrentDirectory = bridgeDir',
-        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File """ & bridgePath & """ ' .. SERVER_URL .. ' " & playerName & "", 1, False',
+        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File """" & bridgePath & """" ""' .. SERVER_URL .. '"" """" & playerName & """"", 1, False',
     }
 
     local f = io.open(vbsPath, "w")
@@ -1065,9 +1079,11 @@ end
 -- first tick after the new level loads performs a full fresh sync.
 
 local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
+EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(EQUIP_HEALTH_ZERO_GRACE_MS / POLL_INTERVAL_MS))
 
 local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
-local lastRecvJson    = ""     -- JSON we last applied from recv.json
+local lastRecvJson    = ""     -- raw recv.json text we last read
+local lastRecvInvJson = ""     -- canonical inventory JSON last applied (format-insensitive)
 local isTransitioning = false  -- pauses polling during level transitions
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
@@ -1146,21 +1162,33 @@ end
 -- writes a new merged inventory.  Every client does this for themselves.
 local function applyIfChanged()
     if isTransitioning then return end
-    -- Skip apply for one tick after we pushed — lets the bridge process push.json
-    -- and update recv.json so we don't immediately apply a stale recv that reverts
-    -- whatever the player just picked up (weapon, mod, ability, melee).
-    if skipNextApply then skipNextApply = false; print("[CrabSync] apply SKIPPED (post-push tick — letting bridge update recv)\n"); return end
+    -- Skip apply for one tick after we pushed: lets the bridge process push.json
+    -- and update recv.json so we do not immediately apply stale data.
+    if skipNextApply then
+        skipNextApply = false
+        print("[CrabSync] apply SKIPPED (post-push tick - letting bridge update recv)\n")
+        return
+    end
     local f = io.open(RECV_FILE, "r")
     if not f then return end
     local json = f:read("*a")
     f:close()
     if json == "" or json == lastRecvJson then return end
-    lastRecvJson = json
+
     local inv = decodeInventory(json)
     if not inv then return end
+    local invJson = encodeInventory(inv)
+    if invJson == lastRecvInvJson then
+        -- Same logical inventory; only raw JSON formatting/order changed.
+        lastRecvJson = json
+        return
+    end
+
     local ps = getLocalPS()
     if not ps then return end
     applyInventory(ps, inv)
+    lastRecvJson = json
+    lastRecvInvJson = invJson
     print("[CrabInventorySync] Applied merged inventory to local player.\n")
 end
 
@@ -1185,6 +1213,7 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
+        lastRecvInvJson = ""
         -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
         -- ownMaxHealth, ownSlots, lastGame* counters).  The game preserves
         -- these values across island clears, so resetting them re-initialises
@@ -1203,6 +1232,7 @@ end)
 RegisterKeyBind(Key.F9, function()
     lastPushedJson   = ""
     lastRecvJson     = ""
+    lastRecvInvJson  = ""
     -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
     -- ownMaxHealth, ownSlots).  Resetting them re-initialises each player's
     -- contribution to the full pooled total, doubling the pool.

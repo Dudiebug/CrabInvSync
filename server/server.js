@@ -206,6 +206,62 @@ function getRoom(roomCode) {
     return rooms[roomCode];
 }
 
+function toFiniteNumber(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function clampInt(value, min, max) {
+    return Math.max(min, Math.min(max, Math.floor(toFiniteNumber(value, min))));
+}
+
+function sanitizeItemArray(items) {
+    if (!Array.isArray(items)) return [];
+    const out = [];
+    for (const item of items) {
+        if (typeof item === 'string') {
+            const name = item.trim();
+            if (!name) continue;
+            out.push({ n: name, l: 1, a: 0 });
+            continue;
+        }
+        if (!item || typeof item !== 'object') continue;
+        const name = typeof item.n === 'string' ? item.n.trim() : '';
+        if (!name) continue;
+        out.push({
+            n: name,
+            l: clampInt(item.l ?? 1, 1, 255),
+            a: Math.max(0, toFiniteNumber(item.a, 0)),
+        });
+    }
+    return out;
+}
+
+function sanitizeInventory(inventory) {
+    const inv = (inventory && typeof inventory === 'object') ? inventory : {};
+    const cleanName = (v) => (typeof v === 'string' ? v : '');
+    const slots = (inv.slots && typeof inv.slots === 'object') ? inv.slots : {};
+    return {
+        weapon: cleanName(inv.weapon),
+        ability: cleanName(inv.ability),
+        melee: cleanName(inv.melee),
+        crystals: Math.max(0, clampInt(inv.crystals ?? 0, 0, Number.MAX_SAFE_INTEGER)),
+        health: Math.max(0, toFiniteNumber(inv.health, 0)),
+        maxHealth: Math.max(0, toFiniteNumber(inv.maxHealth, 0)),
+        weaponMods: sanitizeItemArray(inv.weaponMods),
+        abilityMods: sanitizeItemArray(inv.abilityMods),
+        meleeMods: sanitizeItemArray(inv.meleeMods),
+        perks: sanitizeItemArray(inv.perks),
+        relics: sanitizeItemArray(inv.relics),
+        slots: {
+            weaponMods: clampInt(slots.weaponMods ?? 0, 0, 255),
+            abilityMods: clampInt(slots.abilityMods ?? 0, 0, 255),
+            meleeMods: clampInt(slots.meleeMods ?? 0, 0, 255),
+            perks: clampInt(slots.perks ?? 0, 0, 255),
+        },
+    };
+}
+
 function mergeInventories(room) {
     const now = Date.now();
     const members = room.__members;
@@ -326,22 +382,23 @@ function mergeInventories(room) {
 app.post('/push', (req, res) => {
     const { room, player, inventory, password, players, session, logs } = req.body;
     if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
-    if (!room || !player || !inventory) {
+    if (!room || !player || !inventory || typeof inventory !== 'object' || Array.isArray(inventory)) {
         return res.status(400).json({ error: 'Missing fields' });
     }
 
     const r = getRoom(room);
     const now = Date.now();
+    const cleanInventory = sanitizeInventory(inventory);
     // Per-field change timestamps for weapon / ability / melee.
     // If the player's new value differs from what they last pushed, bump the timestamp
     // so mergeInventories can pick the most recently changed value per-field across
     // all players, rather than all-or-nothing from the most recent overall pusher.
     const prev = r[player];
     const prevInv = prev && prev.inventory;
-    const weaponChangedAt  = (prevInv && prevInv.weapon  === inventory.weapon)  ? (prev.weaponChangedAt  || now) : now;
-    const abilityChangedAt = (prevInv && prevInv.ability === inventory.ability) ? (prev.abilityChangedAt || now) : now;
-    const meleeChangedAt   = (prevInv && prevInv.melee   === inventory.melee)   ? (prev.meleeChangedAt   || now) : now;
-    r[player] = { inventory, updatedAt: now, lastSeen: now, weaponChangedAt, abilityChangedAt, meleeChangedAt };
+    const weaponChangedAt  = (prevInv && prevInv.weapon  === cleanInventory.weapon)  ? (prev.weaponChangedAt  || now) : now;
+    const abilityChangedAt = (prevInv && prevInv.ability === cleanInventory.ability) ? (prev.abilityChangedAt || now) : now;
+    const meleeChangedAt   = (prevInv && prevInv.melee   === cleanInventory.melee)   ? (prev.meleeChangedAt   || now) : now;
+    r[player] = { inventory: cleanInventory, updatedAt: now, lastSeen: now, weaponChangedAt, abilityChangedAt, meleeChangedAt };
 
     if (Array.isArray(players) && players.length > 0) {
         r.__members = new Set(players);
@@ -370,16 +427,16 @@ app.post('/push', (req, res) => {
     const merged = mergeInventories(r);
 
     srvLog('PUSH', `Push from "${player}" in room "${room}"`, {
-        weapon: inventory.weapon || '(none)',
-        ability: inventory.ability || '(none)',
-        melee: inventory.melee || '(none)',
-        crystals: inventory.crystals ?? 0,
-        health: inventory.health ?? 0,
-        wMods: (inventory.weaponMods || []).length,
-        aMods: (inventory.abilityMods || []).length,
-        mMods: (inventory.meleeMods || []).length,
-        perks: (inventory.perks || []).length,
-        relics: (inventory.relics || []).length,
+        weapon: cleanInventory.weapon || '(none)',
+        ability: cleanInventory.ability || '(none)',
+        melee: cleanInventory.melee || '(none)',
+        crystals: cleanInventory.crystals ?? 0,
+        health: cleanInventory.health ?? 0,
+        wMods: (cleanInventory.weaponMods || []).length,
+        aMods: (cleanInventory.abilityMods || []).length,
+        mMods: (cleanInventory.meleeMods || []).length,
+        perks: (cleanInventory.perks || []).length,
+        relics: (cleanInventory.relics || []).length,
         clientLogs: (logs || []).length,
         session: session || '(none)',
     });
