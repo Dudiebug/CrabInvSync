@@ -1038,8 +1038,9 @@ local function autoLaunchBridge()
         'If running Then WScript.Quit',
         -- Launch PowerShell bridge. windowStyle=1 = normal visible so errors are readable.
         'Dim playerName : playerName = sh.ExpandEnvironmentStrings("%USERNAME%")',
+        'Dim q : q = Chr(34)',
         'sh.CurrentDirectory = bridgeDir',
-        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File """" & bridgePath & """" ""' .. SERVER_URL .. '"" """" & playerName & """"", 1, False',
+        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File " & q & bridgePath & q & " " & q & "' .. SERVER_URL .. '" & q & " " & q & playerName & q, 1, False',
     }
 
     local f = io.open(vbsPath, "w")
