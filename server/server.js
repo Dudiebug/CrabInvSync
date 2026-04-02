@@ -245,7 +245,7 @@ function sanitizeInventory(inventory) {
         weapon: cleanName(inv.weapon),
         ability: cleanName(inv.ability),
         melee: cleanName(inv.melee),
-        crystals: Math.max(0, clampInt(inv.crystals ?? 0, 0, Number.MAX_SAFE_INTEGER)),
+        crystals: clampInt(inv.crystals ?? 0, 0, Number.MAX_SAFE_INTEGER),
         health: Math.max(0, toFiniteNumber(inv.health, 0)),
         maxHealth: Math.max(0, toFiniteNumber(inv.maxHealth, 0)),
         weaponMods: sanitizeItemArray(inv.weaponMods),
@@ -382,8 +382,11 @@ function mergeInventories(room) {
 app.post('/push', (req, res) => {
     const { room, player, inventory, password, players, session, logs } = req.body;
     if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
-    if (!room || !player || !inventory || typeof inventory !== 'object' || Array.isArray(inventory)) {
-        return res.status(400).json({ error: 'Missing fields' });
+    if (!room || !player) {
+        return res.status(400).json({ error: 'Missing room or player' });
+    }
+    if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory)) {
+        return res.status(400).json({ error: 'Invalid or missing inventory (must be a JSON object)' });
     }
 
     const r = getRoom(room);
