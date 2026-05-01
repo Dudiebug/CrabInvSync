@@ -2,7 +2,6 @@
 
 Real-time shared inventory sync for **Crab Champions** co-op — a three-tier Lua / PowerShell / Node.js architecture.
 
-> **⚠️ Beta — known crash:** Joining another player's game while this mod is installed will crash your client. Host-only sessions work. See [Known Issues](#known-issues).
 
 ## How it works
 
