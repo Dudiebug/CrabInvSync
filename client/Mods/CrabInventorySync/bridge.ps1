@@ -3,14 +3,18 @@
   No external dependencies. Requires PowerShell 5+ (built into Windows 10/11).
 
   Usage (auto-launched by main.lua — do not run manually):
-    powershell -File bridge.ps1 <serverUrl> <playerName> <roomPassword>
+    powershell -File bridge.ps1 <serverUrl> <playerName> <roomPassword> [instanceId]
 
   Two files talk to the UE4SS Lua mod inside the game:
-    Scripts\push.json  — Lua writes {"room":"...","inventory":{...}}  → bridge POSTs to server
-    Scripts\recv.json  — bridge writes merged inventory               ← server response / poll
+    Scripts\push_<instanceId>.json  — Lua writes {"room":"...","inventory":{...}}  → bridge POSTs to server
+    Scripts\recv_<instanceId>.json  — bridge writes merged inventory               ← server response / poll
 
   Room code is set via roomCode in config.txt and embedded in push.json by Lua.
   All players who want to sync must use the same roomCode.
+
+  Auto-launch passes instanceId so runtime files are push_<instanceId>.json
+  and recv_<instanceId>.json. Manual bridge runs without instanceId still use
+  push.json and recv.json for debugging.
 #>
 param(
     [string]$ServerUrl  = 'https://crab.dudiebug.net',
@@ -94,7 +98,7 @@ while ($true) {
         if (-not (Get-Process -Name $gameProcess -ErrorAction SilentlyContinue)) {
             Log 'Game process not found — sending leave and shutting down.'
             try {
-                $leaveBody = (@{ room = $currentRoom; player = $PlayerName; password = $RoomPassword } | ConvertTo-Json -Compress)
+                $leaveBody = (@{ room = $currentRoom; player = $PlayerName; password = $RoomPassword } | ConvertTo-Json -Compress -Depth 8)
                 Invoke-RestMethod -Uri "$ServerUrl/leave" -Method POST -Body $leaveBody -ContentType 'application/json' -TimeoutSec $RequestTimeoutSec -ErrorAction SilentlyContinue | Out-Null
                 LogFile "LEAVE room=$currentRoom player=$PlayerName"
             } catch {}
@@ -156,7 +160,7 @@ while ($true) {
             # Forward session ID and client logs if present in push.json
             if ($pushData.PSObject.Properties['session']) { $bodyObj['session'] = $pushData.session }
             if ($pushData.PSObject.Properties['logs'])    { $bodyObj['logs']    = $pushData.logs }
-            $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 5
+            $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 8
 
             LogFile "PUSH  room=$currentRoom  player=$PlayerName  body=$bodyJson"
 
@@ -169,7 +173,7 @@ while ($true) {
                 -ErrorAction Stop
 
             if ($resp.inventory) {
-                $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 5
+                $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 8
                 LogFile "RESP  (push) $merged"
                 WriteRecv $merged 'push'
             }
@@ -191,7 +195,7 @@ while ($true) {
 
     # ---- Heartbeat — fire-and-forget, tells the server we're still alive ----
     try {
-        $hbBody = (@{ room = $currentRoom; player = $PlayerName; password = $RoomPassword } | ConvertTo-Json -Compress)
+        $hbBody = (@{ room = $currentRoom; player = $PlayerName; password = $RoomPassword } | ConvertTo-Json -Compress -Depth 8)
         Invoke-RestMethod -Uri "$ServerUrl/heartbeat" -Method POST -Body $hbBody -ContentType 'application/json' -TimeoutSec $RequestTimeoutSec -ErrorAction Stop | Out-Null
     } catch {}
 
@@ -205,7 +209,7 @@ while ($true) {
             -ErrorAction Stop
 
         if ($resp.inventory) {
-            $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 5
+            $merged = $resp.inventory | ConvertTo-Json -Compress -Depth 8
             if ($merged -ne $script:lastRecvJson) {
                 LogFile "RESP  (poll) $merged"
             }

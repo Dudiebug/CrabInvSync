@@ -50,7 +50,7 @@ RegisterKeyBind(Key.F7, function()
         "KillCount", "KillCountThisIsland", "IslandKillCount",
         "EnemiesKilled", "EliminationCount", "TotalKills", "Eliminations",
         "EnemiesKilledThisIsland", "KillsThisIsland", "IslandEliminations",
-        "TastyOrangeCount", "TastyOrangeKills", "PerkKillCount",
+        "PerkKillCount",
         -- Weapon mod count
         "WeaponModCount", "NumWeaponMods", "WeaponModLevel",
         "TotalWeaponModLevels", "WeaponModTotal",

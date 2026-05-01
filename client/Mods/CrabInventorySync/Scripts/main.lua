@@ -1,7 +1,6 @@
 -- Uncomment the line below to enable debug keybinds (F6/F7/F8). Remove when done.
 -- require("debug")
 -- require("debug_perks")
--- require("perk_tastyorange_mod")
 
 -- CrabInventorySync - main.lua
 -- Syncs inventory between all players in a multiplayer session via a PowerShell bridge.
@@ -9,11 +8,11 @@
 -- HOW IT WORKS:
 --   1. All players install this mod folder and set roomCode in config.txt.
 --   2. On mod load the bridge (bridge.ps1) is auto-launched as a PowerShell window.
---   3. Every 500 ms the mod checks for inventory changes and writes push.json.
+--   3. Every 500 ms the mod checks for inventory changes and writes push_<instance>.json.
 --   4. The bridge detects the file change and POSTs it to the server.
 --   5. The server merges all inventories and returns the result to each bridge.
---   6. The bridge writes the merged inventory to recv.json.
---   7. Every player reads recv.json and applies the merged inventory to their own character.
+--   6. The bridge writes the merged inventory to recv_<instance>.json.
+--   7. Every player reads recv_<instance>.json and applies it to their own character.
 --      No "host" designation is needed — each client handles itself.
 --
 -- LIMITATIONS:
@@ -46,12 +45,52 @@ local CRYSTALS_PROPERTY  = "Crystals"
 -- Shared secret sent with every push to keep the server endpoint private.
 local ROOM_PASSWORD      = "4982904"
 
+-- Object-dump-derived property ranges.
+local BYTE_MAX       = 255
+local UINT32_MAX     = 4294967295
+local ITEM_LEVEL_MIN = 1
+
+-- Objectdump: ECrabEnhancementType values are enum-backed byte-sized values.
+-- Keep the numeric payload stable, but accept enum-name strings from UE4SS if a
+-- build exposes TArray elements that way.
+local ECRAB_ENHANCEMENT_VALUES = {
+    None = 0,
+    Bouncing = 1,
+    Accelerating = 2,
+    Zigging = 3,
+    Spiraling = 4,
+    Snaking = 5,
+    Returning = 6,
+    Orbiting = 7,
+    Chipping = 8,
+    Sticky = 9,
+    Growing = 10,
+    Freezing = 11,
+    Flaming = 12,
+    Electrifying = 13,
+    Toxifying = 14,
+    Arcanifying = 15,
+    Persisting = 16,
+    Doubling = 17,
+    Targeting = 18,
+    Damaging = 19,
+    Booming = 20,
+    Tripling = 21,
+    Splitting = 22,
+    Scattering = 23,
+    Expanding = 24,
+    Homing = 25,
+    Endangering = 26,
+    Random = 27,
+    ECrabEnhancementType_MAX = 28,
+}
+
 local SCRIPT_DIR_PRIMARY   = "Mods/CrabInventorySync/Scripts/"
 local SCRIPT_DIR_SECONDARY = "ue4ss/Mods/CrabInventorySync/Scripts/"
 
 -- File-based IPC with bridge.ps1.
--- Lua writes push.json  → bridge detects change and sends to server via HTTP.
--- Bridge writes recv.json ← server broadcasts merged inventory back.
+-- Lua writes push_<INSTANCE_ID>.json; bridge detects change and sends it via HTTP.
+-- Bridge writes recv_<INSTANCE_ID>.json with the merged inventory from the server.
 --
 -- Per-launch INSTANCE_ID suffix prevents two game instances on the same machine
 -- (split-screen, local co-op testing, multi-account box) from overwriting each
@@ -189,6 +228,7 @@ end
 
 local function jsonNumber(n, decimals)
     local num = tonumber(n) or 0
+    if num ~= num or num == math.huge or num == -math.huge then num = 0 end
     local s
     if decimals ~= nil then
         s = string.format("%." .. tostring(decimals) .. "f", num)
@@ -199,16 +239,84 @@ local function jsonNumber(n, decimals)
     return s:gsub(",", ".")
 end
 
--- Encode an array of inventory items as JSON objects {n,l,a}.
--- n = DA name, l = level (ByteProperty, 1-255), a = AccumulatedBuff (float).
+local function clampInt(n, minValue, maxValue)
+    local value = math.floor(tonumber(n) or minValue)
+    if value < minValue then return minValue end
+    if value > maxValue then return maxValue end
+    return value
+end
+
+local function normalizeEnhancementValue(value)
+    if value == nil then return nil end
+    if type(value) == "number" then
+        return clampInt(value, 0, BYTE_MAX)
+    end
+
+    local okNumeric, numeric = pcall(function() return tonumber(value) end)
+    if not okNumeric then numeric = nil end
+    if numeric then
+        return clampInt(numeric, 0, BYTE_MAX)
+    end
+
+    local text = tostring(value)
+    local enumName = text:match("ECrabEnhancementType::([%w_]+)") or text:match("([%w_]+)$")
+    local mapped = enumName and ECRAB_ENHANCEMENT_VALUES[enumName]
+    if mapped ~= nil then
+        return clampInt(mapped, 0, BYTE_MAX)
+    end
+
+    return nil
+end
+
+local function jsonIntArray(arr)
+    local parts = {}
+    for _, value in ipairs(arr or {}) do
+        local normalized = normalizeEnhancementValue(value)
+        if normalized ~= nil then table.insert(parts, tostring(normalized)) end
+    end
+    return "[" .. table.concat(parts, ",") .. "]"
+end
+
+local function parseEnhancementArray(raw)
+    local out = {}
+    if not raw then return out end
+    for value in raw:gmatch("%-?%d+") do
+        table.insert(out, clampInt(value, 0, BYTE_MAX))
+    end
+    return out
+end
+
+local function readEnhancementArray(enhancements)
+    local out = {}
+    if not enhancements then return out end
+
+    pcall(function()
+        enhancements:ForEach(function(_, elem)
+            local raw = elem
+            if type(elem) == "table" or type(elem) == "userdata" then
+                local okGet, value = pcall(function() return elem:get() end)
+                if okGet then raw = value end
+            end
+            local normalized = normalizeEnhancementValue(raw)
+            if normalized ~= nil then table.insert(out, normalized) end
+        end)
+    end)
+
+    return out
+end
+
+-- Encode an array of inventory items as JSON objects {n,l,a,e}.
+-- n = DA name, l = level (ByteProperty, 1-255), a = AccumulatedBuff (float),
+-- e = InventoryInfo.Enhancements enum array.
 -- This is the new payload format for weaponMods/abilityMods/meleeMods/perks/relics.
 local function jsonItemArray(items)
     local parts = {}
     for _, item in ipairs(items) do
-        table.insert(parts, string.format('{"n":%s,"l":%d,"a":%s}',
+        table.insert(parts, string.format('{"n":%s,"l":%d,"a":%s,"e":%s}',
             jsonStr(item.name or ""),
-            math.min(255, math.max(1, math.floor(tonumber(item.level) or 1))),
-            jsonNumber(item.accum, 4)))
+            clampInt(item.level, ITEM_LEVEL_MIN, BYTE_MAX),
+            jsonNumber(item.accum, 4),
+            jsonIntArray(item.enhancements or item.e)))
     end
     return "[" .. table.concat(parts, ",") .. "]"
 end
@@ -236,10 +344,11 @@ local function parseItemArray(json, key)
             if not objE then break end
             local obj = json:sub(objS, objE)
             local name  = obj:match('"n"%s*:%s*"([^"]*)"')
-            local level = tonumber(obj:match('"l"%s*:%s*(%d+)'))   or 1
+            local level = clampInt(obj:match('"l"%s*:%s*(%d+)'), ITEM_LEVEL_MIN, BYTE_MAX)
             local accum = tonumber(obj:match('"a"%s*:%s*(%-?[%d%.]+)')) or 0.0
+            local enhancements = parseEnhancementArray(obj:match('"e"%s*:%s*(%[[^%]]*%])'))
             if name and name ~= "" then
-                table.insert(t, { name=name, level=level, accum=accum })
+                table.insert(t, { name=name, level=level, accum=accum, enhancements=enhancements })
             end
             pos = objE + 1
         end
@@ -248,7 +357,7 @@ local function parseItemArray(json, key)
         local raw = json:match('"' .. key .. '"%s*:%s*(%[[^%]]*%])')
         if raw then
             for name in raw:gmatch('"([^"]*)"') do
-                table.insert(t, { name=name, level=1, accum=0.0 })
+                table.insert(t, { name=name, level=ITEM_LEVEL_MIN, accum=0.0, enhancements={} })
             end
         end
     end
@@ -265,7 +374,7 @@ local function encodeInventory(inv)
         jsonStr(inv.weapon),
         jsonStr(inv.ability),
         jsonStr(inv.melee),
-        math.floor(tonumber(inv.crystals) or 0),
+        clampInt(inv.crystals, 0, UINT32_MAX),
         jsonNumber(inv.health, 3),
         jsonNumber(inv.maxHealth, 3),
         jsonItemArray(inv.weaponMods),
@@ -273,10 +382,10 @@ local function encodeInventory(inv)
         jsonItemArray(inv.meleeMods),
         jsonItemArray(inv.perks),
         jsonItemArray(inv.relics),
-        math.floor(tonumber(sl.weaponMods) or 0),
-        math.floor(tonumber(sl.abilityMods) or 0),
-        math.floor(tonumber(sl.meleeMods)  or 0),
-        math.floor(tonumber(sl.perks)      or 0)
+        clampInt(sl.weaponMods, 0, BYTE_MAX),
+        clampInt(sl.abilityMods, 0, BYTE_MAX),
+        clampInt(sl.meleeMods, 0, BYTE_MAX),
+        clampInt(sl.perks, 0, BYTE_MAX)
     )
 end
 
@@ -291,7 +400,7 @@ local function decodeInventory(json)
     inv.weapon    = json:match('"weapon"%s*:%s*"([^"]*)"')  or ""
     inv.ability   = json:match('"ability"%s*:%s*"([^"]*)"') or ""
     inv.melee     = json:match('"melee"%s*:%s*"([^"]*)"')   or ""
-    inv.crystals  = tonumber(json:match('"crystals"%s*:%s*(%d+)'))          or 0
+    inv.crystals  = clampInt(json:match('"crystals"%s*:%s*(%d+)'), 0, UINT32_MAX)
     inv.health    = tonumber(json:match('"health"%s*:%s*(%-?[%d%.]+)'))     or 0.0
     inv.maxHealth = tonumber(json:match('"maxHealth"%s*:%s*(%-?[%d%.]+)'))  or 0.0
 
@@ -304,10 +413,10 @@ local function decodeInventory(json)
     -- Parse slots sub-object.
     local slotsBlock = json:match('"slots"%s*:%s*(%b{})')
     inv.slots = {
-        weaponMods  = tonumber(slotsBlock and slotsBlock:match('"weaponMods"%s*:%s*(%d+)'))  or 0,
-        abilityMods = tonumber(slotsBlock and slotsBlock:match('"abilityMods"%s*:%s*(%d+)')) or 0,
-        meleeMods   = tonumber(slotsBlock and slotsBlock:match('"meleeMods"%s*:%s*(%d+)'))   or 0,
-        perks       = tonumber(slotsBlock and slotsBlock:match('"perks"%s*:%s*(%d+)'))       or 0,
+        weaponMods  = clampInt(slotsBlock and slotsBlock:match('"weaponMods"%s*:%s*(%d+)'), 0, BYTE_MAX),
+        abilityMods = clampInt(slotsBlock and slotsBlock:match('"abilityMods"%s*:%s*(%d+)'), 0, BYTE_MAX),
+        meleeMods   = clampInt(slotsBlock and slotsBlock:match('"meleeMods"%s*:%s*(%d+)'), 0, BYTE_MAX),
+        perks       = clampInt(slotsBlock and slotsBlock:match('"perks"%s*:%s*(%d+)'), 0, BYTE_MAX),
     }
     return inv
 end
@@ -358,9 +467,9 @@ local function computeSlotCounts(ps, propName, daField)
 end
 
 -- Read all mod/perk/relic slots on ps and return a sorted array of item objects
--- { name=string, level=int, accum=float }.
--- Reads InventoryInfo.Level and InventoryInfo.AccumulatedBuff directly from each
--- TArray struct element so the push payload includes per-item level data.
+-- { name=string, level=int, accum=float, enhancements=int[] }.
+-- Reads InventoryInfo directly from each TArray struct element so the push
+-- payload includes per-item Level, AccumulatedBuff, and Enhancements data.
 local function readItemArray(ps, propName, daField)
     local items = {}
     pcall(function()
@@ -372,15 +481,16 @@ local function readItemArray(ps, propName, daField)
             if not okda or not da then return end
             local name = getDAName(da)
             if name == "" then return end
-            local level, accum = 1, 0.0
+            local level, accum, enhancements = 1, 0.0, {}
             pcall(function()
                 local info = elem:get().InventoryInfo
                 if info then
-                    level = math.max(1, math.floor(tonumber(info.Level) or 1))
+                    level = clampInt(info.Level, ITEM_LEVEL_MIN, BYTE_MAX)
                     accum = tonumber(info.AccumulatedBuff) or 0.0
+                    enhancements = readEnhancementArray(info.Enhancements)
                 end
             end)
-            table.insert(items, { name=name, level=level, accum=accum })
+            table.insert(items, { name=name, level=level, accum=accum, enhancements=enhancements })
         end)
     end)
     -- Sort by name so the encoded JSON is deterministic regardless of TArray order.
@@ -458,10 +568,7 @@ end
 -- ============================================================
 -- SET-COMPARISON HELPERS
 -- ============================================================
--- Compare two sorted string arrays element-by-element.
--- Used to detect whether a recv payload would actually change the set of mods
--- in a given slot array, vs. merely reflecting UE4 TArray internal reordering.
--- IMPORTANT: both arrays must already be sorted before calling this.
+-- Compare two string arrays element-by-element.
 local function arraysEqual(a, b)
     if #a ~= #b then return false end
     for i = 1, #a do
@@ -470,26 +577,275 @@ local function arraysEqual(a, b)
     return true
 end
 
--- Return the sorted list of DA names currently stored in a TArray on ps.
--- Used by applyInventory to compare the live game state against the recv payload
--- without being fooled by TArray reordering (which is not a real inventory change).
-local function getSortedNamesFromPS(ps, propName, daField)
+local function normalizedAccum(value)
+    local n = tonumber(value) or 0.0
+    if n ~= n or n == math.huge or n == -math.huge then return 0.0 end
+    return n
+end
+
+local function normalizeEnhancementList(values)
+    local out = {}
+    for _, value in ipairs(values or {}) do
+        local normalized = normalizeEnhancementValue(value)
+        if normalized ~= nil then table.insert(out, normalized) end
+    end
+    return out
+end
+
+local function normalizeItem(item)
+    item = item or {}
+    return {
+        name = tostring(item.name or item.n or ""),
+        level = clampInt(item.level or item.l, ITEM_LEVEL_MIN, BYTE_MAX),
+        accum = normalizedAccum(item.accum or item.a),
+        enhancements = normalizeEnhancementList(item.enhancements or item.e),
+    }
+end
+
+local function enhancementSignature(enhancements)
+    local parts = {}
+    for _, value in ipairs(normalizeEnhancementList(enhancements)) do
+        table.insert(parts, tostring(value))
+    end
+    return table.concat(parts, ",")
+end
+
+local function itemSignature(item)
+    local normalized = normalizeItem(item)
+    return table.concat({
+        normalized.name,
+        tostring(normalized.level),
+        jsonNumber(normalized.accum, 4),
+        enhancementSignature(normalized.enhancements),
+    }, "|")
+end
+
+local function sortedItemSignatures(items)
+    local signatures = {}
+    for _, item in ipairs(items or {}) do
+        local normalized = normalizeItem(item)
+        if normalized.name ~= "" then table.insert(signatures, itemSignature(normalized)) end
+    end
+    table.sort(signatures)
+    return signatures
+end
+
+local function itemSignaturesInOrder(items)
+    local signatures = {}
+    for _, item in ipairs(items or {}) do
+        local normalized = normalizeItem(item)
+        if normalized.name ~= "" then table.insert(signatures, itemSignature(normalized)) end
+    end
+    return signatures
+end
+
+local function sortedItemNames(items)
     local names = {}
+    for _, item in ipairs(items or {}) do
+        local normalized = normalizeItem(item)
+        if normalized.name ~= "" then table.insert(names, normalized.name) end
+    end
+    table.sort(names)
+    return names
+end
+
+local function sortedNormalizedItems(items)
+    local normalized = {}
+    for _, item in ipairs(items or {}) do
+        local n = normalizeItem(item)
+        if n.name ~= "" then table.insert(normalized, n) end
+    end
+    table.sort(normalized, function(a, b)
+        return itemSignature(a) < itemSignature(b)
+    end)
+    return normalized
+end
+
+local function groupItemsByName(items)
+    local groups = {}
+    for _, item in ipairs(items or {}) do
+        local normalized = normalizeItem(item)
+        if normalized.name ~= "" then
+            if not groups[normalized.name] then groups[normalized.name] = {} end
+            table.insert(groups[normalized.name], item)
+        end
+    end
+    return groups
+end
+
+local function getItemsFromPS(ps, propName, daField)
+    local items = {}
     pcall(function()
         local arr = ps:GetPropertyValue(propName)
         if not arr then return end
-        arr:ForEach(function(_, elem)
-            if elem:get():IsValid() then
-                local ok, da = pcall(function() return elem:get()[daField] end)
-                if ok and da then
+        arr:ForEach(function(index, elem)
+            local okSlot, slot = pcall(function() return elem:get() end)
+            if okSlot and slot:IsValid() then
+                local okDa, da = pcall(function() return slot[daField] end)
+                if okDa and da then
                     local name = getDAName(da)
-                    if name ~= "" then table.insert(names, name) end
+                    if name ~= "" then
+                        local level, accum, enhancements, info = ITEM_LEVEL_MIN, 0.0, {}, nil
+                        pcall(function()
+                            info = slot.InventoryInfo
+                            if info then
+                                level = clampInt(info.Level, ITEM_LEVEL_MIN, BYTE_MAX)
+                                accum = normalizedAccum(info.AccumulatedBuff)
+                                enhancements = readEnhancementArray(info.Enhancements)
+                            end
+                        end)
+                        table.insert(items, {
+                            name=name,
+                            level=level,
+                            accum=accum,
+                            enhancements=enhancements,
+                            slot=slot,
+                            info=info,
+                            index=index,
+                        })
+                    end
                 end
             end
         end)
     end)
-    table.sort(names)
-    return names
+    return items
+end
+
+local function pairItemsByName(gameItems, recvItems)
+    local gameGroups = groupItemsByName(gameItems)
+    local recvGroups = groupItemsByName(recvItems)
+    local pairsOut = {}
+
+    for name, gameGroup in pairs(gameGroups) do
+        local recvGroup = recvGroups[name] or {}
+        if #gameGroup ~= #recvGroup then
+            return nil, string.format("unable to pair safely for %s: game=%d recv=%d", name, #gameGroup, #recvGroup)
+        end
+    end
+    for name, recvGroup in pairs(recvGroups) do
+        local gameGroup = gameGroups[name] or {}
+        if #gameGroup ~= #recvGroup then
+            return nil, string.format("unable to pair safely for %s: game=%d recv=%d", name, #gameGroup, #recvGroup)
+        end
+    end
+
+    for name, gameGroup in pairs(gameGroups) do
+        local recvGroup = recvGroups[name] or {}
+        table.sort(gameGroup, function(a, b)
+            local sigA, sigB = itemSignature(a), itemSignature(b)
+            if sigA == sigB then return (a.index or 0) < (b.index or 0) end
+            return sigA < sigB
+        end)
+        table.sort(recvGroup, function(a, b)
+            return itemSignature(a) < itemSignature(b)
+        end)
+        for i = 1, #gameGroup do
+            table.insert(pairsOut, { live=gameGroup[i], incoming=normalizeItem(recvGroup[i]) })
+        end
+    end
+
+    table.sort(pairsOut, function(a, b)
+        local sigA = itemSignature(a.incoming)
+        local sigB = itemSignature(b.incoming)
+        if sigA == sigB then return (a.live.index or 0) < (b.live.index or 0) end
+        return sigA < sigB
+    end)
+    return pairsOut, nil
+end
+
+local function applyScalarMetadataForPairs(label, gameItems, recvItems)
+    local pairsOut, err = pairItemsByName(gameItems, recvItems)
+    if not pairsOut then
+        print(string.format("[CrabSync:apply] %s scalar metadata skipped: %s\n", label, err or "unable to pair safely"))
+        return false
+    end
+
+    local updated, alreadyMatched, enhancementSkipped = 0, 0, 0
+    for _, pair in ipairs(pairsOut) do
+        local live, incoming = pair.live, pair.incoming
+        if not live.info then
+            print(string.format("[CrabSync:apply] %s scalar metadata skipped for %s: InventoryInfo unavailable\n", label, live.name))
+        else
+            local wantedLevel = clampInt(incoming.level, ITEM_LEVEL_MIN, BYTE_MAX)
+            local wantedAccum = normalizedAccum(incoming.accum)
+            local curLevel = clampInt(live.info.Level, ITEM_LEVEL_MIN, BYTE_MAX)
+            local curAccum = normalizedAccum(live.info.AccumulatedBuff)
+            local changed = false
+
+            if curLevel ~= wantedLevel then
+                pcall(function() live.info.Level = wantedLevel end)
+                changed = true
+            end
+            if jsonNumber(curAccum, 4) ~= jsonNumber(wantedAccum, 4) then
+                pcall(function() live.info.AccumulatedBuff = wantedAccum end)
+                changed = true
+            end
+
+            if changed then
+                updated = updated + 1
+                print(string.format(
+                    "[CrabSync:apply] %s scalar metadata updated for %s: level %d->%d, accum %s->%s\n",
+                    label, live.name, curLevel, wantedLevel, jsonNumber(curAccum, 4), jsonNumber(wantedAccum, 4)))
+            else
+                alreadyMatched = alreadyMatched + 1
+            end
+
+            if enhancementSignature(live.enhancements) ~= enhancementSignature(incoming.enhancements) then
+                enhancementSkipped = enhancementSkipped + 1
+                print(string.format(
+                    "[CrabSync:apply] %s enhancement mismatch skipped for %s: game=[%s] recv=[%s]\n",
+                    label, live.name, enhancementSignature(live.enhancements), enhancementSignature(incoming.enhancements)))
+            end
+        end
+    end
+
+    if updated == 0 and enhancementSkipped == 0 then
+        print(string.format("[CrabSync:apply] %s scalar metadata already matched (%d paired items)\n", label, alreadyMatched))
+    end
+    return updated > 0
+end
+
+local function compareItemMetadata(gameItems, recvItems)
+    local gameNames = sortedItemNames(gameItems)
+    local recvNames = sortedItemNames(recvItems)
+    if not arraysEqual(gameNames, recvNames) then
+        return { kind="name mismatch", slotWriteCandidate=true }
+    end
+
+    local gameSorted = sortedItemSignatures(gameItems)
+    local recvSorted = sortedItemSignatures(recvItems)
+    if arraysEqual(gameSorted, recvSorted) then
+        if arraysEqual(itemSignaturesInOrder(gameItems), itemSignaturesInOrder(recvItems)) then
+            return { kind="same" }
+        end
+        return { kind="reorder-only no-op" }
+    end
+
+    local gameNorm = sortedNormalizedItems(gameItems)
+    local recvNorm = sortedNormalizedItems(recvItems)
+    local flags = { level=false, accum=false, enhancements=false }
+    local maxLen = math.max(#gameNorm, #recvNorm)
+    for i = 1, maxLen do
+        local g, r = gameNorm[i], recvNorm[i]
+        if g and r and g.name == r.name then
+            if g.level ~= r.level then flags.level = true end
+            if jsonNumber(g.accum, 4) ~= jsonNumber(r.accum, 4) then flags.accum = true end
+            if enhancementSignature(g.enhancements) ~= enhancementSignature(r.enhancements) then
+                flags.enhancements = true
+            end
+        end
+    end
+
+    local reasons = {}
+    if flags.level then table.insert(reasons, "level mismatch") end
+    if flags.accum then table.insert(reasons, "accumulated buff mismatch") end
+    if flags.enhancements then table.insert(reasons, "enhancement mismatch") end
+    if #reasons == 0 then table.insert(reasons, "metadata mismatch") end
+    return {
+        kind = table.concat(reasons, ", "),
+        metadataMismatch = true,
+        enhancementMismatch = flags.enhancements,
+    }
 end
 
 -- Return (filledSlots, totalSlots) for a TArray inventory property.
@@ -515,7 +871,7 @@ end
 -- Weapon/ability/melee debounce state.
 -- The game briefly reports a stale ability during ability use (e.g. Black Hole → Grappling
 -- Hook for one tick while the animation plays).  We only promote a new value to "stable"
--- after SLOT_STABLE_TICKS consecutive identical reads, so that flicker never reaches push.json.
+-- after SLOT_STABLE_TICKS consecutive identical reads, so that flicker never reaches PUSH_FILE.
 -- After an apply the state is anchored so the applied value is not immediately treated as
 -- a new change and pushed back (which would start the receive → push → receive loop).
 local SLOT_STABLE_TICKS = 4   -- 4 × POLL_INTERVAL_MS = 2.0 s debounce window
@@ -607,7 +963,7 @@ local function readInventory(ps)
 
     if SYNC_CRYSTALS then
         pcall(function()
-            local raw = math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0)
+            local raw = clampInt(ps:GetPropertyValue(CRYSTALS_PROPERTY), 0, UINT32_MAX)
             if lastGameCrystals == nil then
                 -- First ever read: everything is ours (no sync has happened yet).
                 ownCrystals      = raw
@@ -619,7 +975,7 @@ local function readInventory(ps)
                 -- The applied sync total was already baked into lastGameCrystals by
                 -- applyInventory, so the next tick's delta for an uneventful tick is 0.
                 local delta = raw - lastGameCrystals
-                ownCrystals      = math.max(0, (ownCrystals or 0) + delta)
+                ownCrystals      = clampInt((ownCrystals or 0) + delta, 0, UINT32_MAX)
                 lastGameCrystals = raw
             end
             inv.crystals = ownCrystals
@@ -750,7 +1106,7 @@ local function readInventory(ps)
         }
         for _, sp in ipairs(slotProps) do
             pcall(function()
-                local raw = math.floor(tonumber(ps:GetPropertyValue(sp.prop)) or 0)
+                local raw = clampInt(ps:GetPropertyValue(sp.prop), 0, BYTE_MAX)
                 if lastGameSlots[sp.key] == nil then
                     -- First read: treat everything we see as our own contribution.
                     ownSlots[sp.key]      = raw
@@ -761,7 +1117,7 @@ local function readInventory(ps)
                     -- are ignored so applied totals don't shrink our contribution.
                     local delta = raw - lastGameSlots[sp.key]
                     if delta > 0 then
-                        ownSlots[sp.key] = (ownSlots[sp.key] or 0) + delta
+                        ownSlots[sp.key] = clampInt((ownSlots[sp.key] or 0) + delta, 0, BYTE_MAX)
                     end
                     lastGameSlots[sp.key] = raw
                 end
@@ -859,9 +1215,8 @@ local function applyInventory(ps, inv)
             -- CrabPS.Crystals is UInt32Property (dump §2.1 offset 0x470) — unsigned,
             -- range 0–4,294,967,295.  A pooled server total from many players could exceed
             -- that; clamping prevents a wrap-to-near-zero write that would wipe all crystals.
-            local UINT32_MAX = 4294967295
-            local total   = math.min(math.max(0, math.floor(tonumber(inv.crystals) or 0)), UINT32_MAX)
-            local current = math.min(math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0), UINT32_MAX)
+            local total   = clampInt(inv.crystals, 0, UINT32_MAX)
+            local current = clampInt(ps:GetPropertyValue(CRYSTALS_PROPERTY), 0, UINT32_MAX)
             -- Always write the merged total, even if it is lower than the current value.
             -- The delta-tracker in readInventory already anchors lastGameCrystals to
             -- whatever we write here, so the very next tick sees delta = 0 and does NOT
@@ -995,17 +1350,18 @@ local function applyInventory(ps, inv)
     -- We re-read the actual TArray after writing rather than assuming all items landed,
     -- since applySlotArray silently skips items beyond the player's slot count.
     --
-    -- SET-BASED GUARD: before each slot write, compare the sorted set of names in
-    -- recv against the sorted set currently in the TArray.  If they are identical
-    -- (i.e. same mods, just a different UE4 TArray order) we skip the write entirely.
+    -- METADATA-AWARE GUARD: before each slot write, compare sorted item
+    -- signatures from recv against the live TArray. A signature includes DA
+    -- name, Level, AccumulatedBuff, and Enhancements, so same-name metadata
+    -- differences are detected while reorder-only changes remain no-ops.
     --
     -- Why this matters:
     --   applySlotArray writes recv[1] → slot 0, recv[2] → slot 1, etc.  If TArray
     --   reordering has shuffled the game's internal order, the write swaps the DA
     --   pointer in each slot WITHOUT moving the InventoryInfo struct (Level, Enhancements
     --   live with the slot, not the DA).  Result: mod names rotate between slots while
-    --   their Levels stay behind — the "shuffle" bug.  Skipping the write when the SET
-    --   is unchanged prevents this entirely.
+    --   their Levels stay behind — the "shuffle" bug.  Skipping the write when
+    --   metadata signatures match prevents this entirely.
     for _, entry in ipairs({
         { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  da="WeaponModDA",  list=weaponModDAs,  src=inv.weaponMods,  key="weaponMods"  },
         { flag=SYNC_ABILITY_MODS, prop="AbilityMods", da="AbilityModDA", list=abilityModDAs, src=inv.abilityMods, key="abilityMods" },
@@ -1014,14 +1370,28 @@ local function applyInventory(ps, inv)
         { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      list=relicDAs,      src=inv.relics,      key="relics"      },
     }) do
         if entry.flag then
-            -- entry.src is now an array of {name,level,accum} objects.
-            -- Extract sorted names for the set-comparison (we don't want TArray
-            -- reordering to trigger a slot write — only real add/remove changes do).
-            local sortedSrc = {}
-            for _, item in ipairs(entry.src) do table.insert(sortedSrc, item.name) end
-            table.sort(sortedSrc)
-            local gameSorted = getSortedNamesFromPS(ps, entry.prop, entry.da)
-            if not arraysEqual(gameSorted, sortedSrc) then
+            -- entry.src is an array of {name,level,accum,enhancements} objects.
+            -- Compare full metadata signatures first; only DA-name mismatches can
+            -- trigger slot writes.
+            local recvItems = {}
+            for _, item in ipairs(entry.src) do table.insert(recvItems, normalizeItem(item)) end
+            local gameItems = getItemsFromPS(ps, entry.prop, entry.da)
+            local diff = compareItemMetadata(gameItems, recvItems)
+
+            if diff.kind == "reorder-only no-op" then
+                print(string.format(
+                    "[CrabSync:apply] %s reorder-only no-op - item metadata signatures match\n",
+                    entry.prop))
+            elseif diff.kind == "same" then
+                applyScalarMetadataForPairs(entry.prop, gameItems, recvItems)
+            elseif diff.metadataMismatch then
+                print(string.format(
+                    "[CrabSync:apply] %s metadata differs (%s) - no slot rebuild\n",
+                    entry.prop, diff.kind))
+                applyScalarMetadataForPairs(entry.prop, gameItems, recvItems)
+            elseif diff.slotWriteCandidate then
+                local gameSorted = sortedItemNames(gameItems)
+                local sortedSrc = sortedItemNames(recvItems)
                 local gameCounts = {}
                 for _, name in ipairs(gameSorted) do
                     gameCounts[name] = (gameCounts[name] or 0) + 1
@@ -1051,71 +1421,20 @@ local function applyInventory(ps, inv)
                 local hasVacancy = totalSlots > filledSlots
                 if missingInRecv or (newInRecv and hasVacancy) then
                     print(string.format(
-                        "[CrabSync:apply] %s changed (%d game / %d recv, slots %d/%d) - writing slots\n",
+                        "[CrabSync:apply] %s name mismatch (%d game / %d recv, slots %d/%d) - writing slots\n",
                         entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
                     -- applySlotArray expects a flat name list for its wanted-set logic.
                     applySlotArray(entry.prop, entry.da, entry.list, sortedSrc)
+                    local postWriteItems = getItemsFromPS(ps, entry.prop, entry.da)
+                    applyScalarMetadataForPairs(entry.prop, postWriteItems, recvItems)
+                else
+                    print(string.format(
+                        "[CrabSync:apply] %s name mismatch (%d game / %d recv, slots %d/%d) - no safe slot write\n",
+                        entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
+                    applyScalarMetadataForPairs(entry.prop, gameItems, recvItems)
                 end
             end
         end
-    end
-
-    -- Level + AccumulatedBuff upgrade pass.
-    -- Runs over every slot regardless of whether applySlotArray wrote to it.
-    -- If the server has a higher Level for a mod the player already owns
-    -- (earned by another player picking up duplicates), we write it here.
-    -- We NEVER downgrade — only take the max.
-    --
-    -- Note: Enhancements (Anvil upgrades, nested TArray<enum>) are not written
-    -- here because growing a nested TArray inside a struct inside a TArray is
-    -- not safely supported by UE4SS. They are pushed/pulled in the payload for
-    -- future use once a safe write path is confirmed.
-    local function applyInventoryInfo(propName, daField, srcItems)
-        -- Build a lookup: name → {level, accum}
-        local recvInfo = {}
-        for _, item in ipairs(srcItems) do
-            recvInfo[item.name] = item
-        end
-        pcall(function()
-            local arr = ps:GetPropertyValue(propName)
-            if not arr then return end
-            arr:ForEach(function(_, elem)
-                if not elem:get():IsValid() then return end
-                local okda, da = pcall(function() return elem:get()[daField] end)
-                if not okda or not da then return end
-                local name = getDAName(da)
-                local wanted = recvInfo[name]
-                if not wanted then return end
-                pcall(function()
-                    local info = elem:get().InventoryInfo
-                    if not info then return end
-                    -- Level: only upgrade, never downgrade.
-                    -- CrabInventoryInfo.Level is ByteProperty (0-255); clamp to
-                    -- prevent wrap-around that would reset progress to 0.
-                    local curLevel    = math.floor(tonumber(info.Level) or 1)
-                    local wantedLevel = math.min(255, math.floor(tonumber(wanted.level) or 1))
-                    if wantedLevel > curLevel then
-                        info.Level = wantedLevel
-                    end
-                    -- AccumulatedBuff: take the max (relics accumulate over time).
-                    local curAccum    = tonumber(info.AccumulatedBuff) or 0.0
-                    local wantedAccum = tonumber(wanted.accum)         or 0.0
-                    if wantedAccum > curAccum then
-                        info.AccumulatedBuff = wantedAccum
-                    end
-                end)
-            end)
-        end)
-    end
-
-    for _, entry in ipairs({
-        { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  da="WeaponModDA",  src=inv.weaponMods  },
-        { flag=SYNC_ABILITY_MODS, prop="AbilityMods", da="AbilityModDA", src=inv.abilityMods },
-        { flag=SYNC_MELEE_MODS,   prop="MeleeMods",   da="MeleeModDA",   src=inv.meleeMods   },
-        { flag=SYNC_PERKS,        prop="Perks",       da="PerkDA",       src=inv.perks       },
-        { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      src=inv.relics      },
-    }) do
-        if entry.flag then applyInventoryInfo(entry.prop, entry.da, entry.src) end
     end
 
     -- Notify the game that inventory changed so UI slots and mod-effect systems
@@ -1133,10 +1452,10 @@ local function applyInventory(ps, inv)
             { prop="NumMeleeModSlots",   key="meleeMods"   },
             { prop="NumPerkSlots",       key="perks"       },
         }) do
-            local incoming = math.min(255, math.floor(tonumber(inv.slots[entry.key]) or 0))
+            local incoming = clampInt(inv.slots[entry.key], 0, BYTE_MAX)
             if incoming > 0 then
                 pcall(function()
-                    local current = math.floor(tonumber(ps:GetPropertyValue(entry.prop)) or 0)
+                    local current = clampInt(ps:GetPropertyValue(entry.prop), 0, BYTE_MAX)
                     if incoming > current then
                         ps:SetPropertyValue(entry.prop, incoming)
                         -- Anchor the delta tracker to what we just wrote so the very next
@@ -1219,10 +1538,10 @@ end
 --
 --   1. pushIfChanged  — reads the local player's inventory and compares it
 --      (as a JSON string) to the last thing we pushed.  If anything changed
---      (new perk, weapon swap, crystals gained, etc.) push.json is updated
+--      (new perk, weapon swap, crystals gained, etc.) PUSH_FILE is updated
 --      immediately so the bridge forwards it to the server.
 --
---   2. applyIfChanged — reads recv.json and compares it to the last merged
+--   2. applyIfChanged — reads RECV_FILE and compares it to the last merged
 --      inventory we applied.  Every player does this independently; no host
 --      designation needed.  Each client applies the merged result to their
 --      own PlayerState only (the one this client actually owns/controls).
@@ -1237,12 +1556,12 @@ local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
 EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(EQUIP_HEALTH_ZERO_GRACE_MS / POLL_INTERVAL_MS))
 local FORCE_PUSH_INTERVAL_SEC = 10  -- periodic refresh push keeps room state alive after reconnects
 
-local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
-local lastRecvJson    = ""     -- raw recv.json text we last read
+local lastPushedJson  = ""     -- inventory JSON last written to PUSH_FILE (change detection)
+local lastRecvJson    = ""     -- raw RECV_FILE text we last read
 local lastRecvInvJson = ""     -- canonical inventory JSON last applied (format-insensitive)
-local lastPushAtSec   = 0      -- os.time() of the last write to push.json
+local lastPushAtSec   = 0      -- os.time() of the last write to PUSH_FILE
 local isTransitioning = false  -- pauses polling during level transitions
-local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
+local skipNextApply   = false  -- true for one tick after a push, so bridge can update RECV_FILE
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
 
 -- Crystal delta-tracking — prevents the feedback loop caused by applying the server's
@@ -1275,7 +1594,7 @@ local skipNextApply   = false  -- true for one tick after a push, so bridge can 
 -- not the already-synced total (which would cause doubling on every subsequent push).
 -- NOTE: These are forward-declared above the read/apply helpers so all code paths
 -- share one set of upvalues.
--- Write push.json when inventory changed, plus a periodic keepalive rewrite.
+-- Write PUSH_FILE when inventory changed, plus a periodic keepalive rewrite.
 -- The keepalive prevents stale ghost state after reconnect/server restart:
 -- unchanged inventory still gets re-advertised every FORCE_PUSH_INTERVAL_SEC.
 -- The file is written as {"room":"...","inventory":{...}} so the bridge can
@@ -1315,12 +1634,12 @@ local function pushIfChanged()
     end
 end
 
--- Apply recv.json to the local player's own PlayerState whenever the bridge
+-- Apply RECV_FILE to the local player's own PlayerState whenever the bridge
 -- writes a new merged inventory.  Every client does this for themselves.
 local function applyIfChanged()
     if isTransitioning then return end
-    -- Skip apply for one tick after we pushed: lets the bridge process push.json
-    -- and update recv.json so we do not immediately apply stale data.
+    -- Skip apply for one tick after we pushed: lets the bridge process PUSH_FILE
+    -- and update RECV_FILE so we do not immediately apply stale data.
     if skipNextApply then
         skipNextApply = false
         print("[CrabSync] apply SKIPPED (post-push tick - letting bridge update recv)\n")
@@ -1374,7 +1693,7 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
         lastPushAtSec   = 0
-        lastRecvJson    = ""   -- force fresh apply if recv.json has data
+        lastRecvJson    = ""   -- force fresh apply if RECV_FILE has data
         lastRecvInvJson = ""
         -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
         -- ownMaxHealth, ownSlots, lastGame* counters).  The game preserves
@@ -1408,7 +1727,7 @@ end)
 -- Kick off the poll loop.  First tick fires after one interval so the game
 -- has a moment to finish initialising before we start reading PlayerState.
 -- Skip entirely if the config couldn't provide a usable server URL / room code —
--- otherwise we'd spam bridge.log and push.json with writes that can't succeed.
+-- otherwise we'd spam bridge.log and PUSH_FILE with writes that can't succeed.
 if CONFIG_VALID then
     ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
 end

@@ -37,6 +37,9 @@ const MAX_IDENTIFIER_LEN = 96;
 const MAX_SESSION_LEN = 128;
 const MAX_LOG_BATCH_PER_PUSH = 500;
 const MAX_LOG_STRING_LEN = 2048;
+const BYTE_MAX = 255;
+const UINT32_MAX = 0xFFFFFFFF;
+const ITEM_LEVEL_MIN = 1;
 
 const LOGS_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR);
@@ -231,6 +234,24 @@ function clampInt(value, min, max) {
     return Math.max(min, Math.min(max, Math.floor(toFiniteNumber(value, min))));
 }
 
+function sanitizeEnhancements(value) {
+    if (!Array.isArray(value)) return [];
+    const out = [];
+    for (const raw of value) {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) continue;
+        out.push(clampInt(n, 0, BYTE_MAX));
+    }
+    return out;
+}
+
+function mergeEnhancements(a, b) {
+    const seen = new Set();
+    for (const value of sanitizeEnhancements(a)) seen.add(value);
+    for (const value of sanitizeEnhancements(b)) seen.add(value);
+    return [...seen].sort((left, right) => left - right);
+}
+
 function sanitizeItemArray(items) {
     if (!Array.isArray(items)) return [];
     const out = [];
@@ -238,7 +259,7 @@ function sanitizeItemArray(items) {
         if (typeof item === 'string') {
             const name = item.trim();
             if (!name) continue;
-            out.push({ n: name, l: 1, a: 0 });
+            out.push({ n: name, l: ITEM_LEVEL_MIN, a: 0, e: [] });
             continue;
         }
         if (!item || typeof item !== 'object') continue;
@@ -246,8 +267,9 @@ function sanitizeItemArray(items) {
         if (!name) continue;
         out.push({
             n: name,
-            l: clampInt(item.l ?? 1, 1, 255),
-            a: Math.max(0, toFiniteNumber(item.a, 0)),
+            l: clampInt(item.l ?? ITEM_LEVEL_MIN, ITEM_LEVEL_MIN, BYTE_MAX),
+            a: toFiniteNumber(item.a, 0),
+            e: sanitizeEnhancements(item.e),
         });
     }
     return out;
@@ -261,7 +283,7 @@ function sanitizeInventory(inventory) {
         weapon: cleanName(inv.weapon),
         ability: cleanName(inv.ability),
         melee: cleanName(inv.melee),
-        crystals: Math.max(0, clampInt(inv.crystals ?? 0, 0, Number.MAX_SAFE_INTEGER)),
+        crystals: clampInt(inv.crystals ?? 0, 0, UINT32_MAX),
         health: Math.max(0, toFiniteNumber(inv.health, 0)),
         maxHealth: Math.max(0, toFiniteNumber(inv.maxHealth, 0)),
         weaponMods: sanitizeItemArray(inv.weaponMods),
@@ -270,10 +292,10 @@ function sanitizeInventory(inventory) {
         perks: sanitizeItemArray(inv.perks),
         relics: sanitizeItemArray(inv.relics),
         slots: {
-            weaponMods: clampInt(slots.weaponMods ?? 0, 0, 255),
-            abilityMods: clampInt(slots.abilityMods ?? 0, 0, 255),
-            meleeMods: clampInt(slots.meleeMods ?? 0, 0, 255),
-            perks: clampInt(slots.perks ?? 0, 0, 255),
+            weaponMods: clampInt(slots.weaponMods ?? 0, 0, BYTE_MAX),
+            abilityMods: clampInt(slots.abilityMods ?? 0, 0, BYTE_MAX),
+            meleeMods: clampInt(slots.meleeMods ?? 0, 0, BYTE_MAX),
+            perks: clampInt(slots.perks ?? 0, 0, BYTE_MAX),
         },
     };
 }
@@ -431,9 +453,9 @@ function mergeInventories(room) {
         slots:       { weaponMods: 0, abilityMods: 0, meleeMods: 0, perks: 0 },
     };
 
-    // modMax[category][name] = { count, level, accum }
+    // modMax[category][name] = { count, level, accum, enhancements }
     // Tracks the best values seen across all players for each item.
-    // Handles both the new {n,l,a} object format and the legacy plain-string format.
+    // Handles both the new {n,l,a,e} object format and legacy {n,l,a}/string formats.
     const modMax = {
         weaponMods:  {},
         abilityMods: {},
@@ -453,21 +475,27 @@ function mergeInventories(room) {
         // pool naturally reflects perk bonuses without double-counting.
         if (inv.maxHealth) merged.maxHealth += inv.maxHealth;
         for (const key of ['weaponMods', 'abilityMods', 'meleeMods', 'perks', 'relics']) {
-            // Each element is either a legacy plain string or a new {n, l, a} object.
-            // Normalise to { name, level, accum } then merge into modMax.
-            const playerBest = {};   // name → { count, level, accum } for this player's push
+            // Each element is either a legacy plain string or a {n, l, a, e} object.
+            // Normalise to { name, level, accum, enhancements } then merge into modMax.
+            const playerBest = {};   // name → { count, level, accum, enhancements } for this player's push
             for (const item of (inv[key] || [])) {
                 const name  = typeof item === 'string' ? item : (item && item.n);
-                const level = (typeof item === 'object' && item) ? (item.l || 1) : 1;
-                const accum = (typeof item === 'object' && item) ? (item.a || 0) : 0;
+                const level = (typeof item === 'object' && item)
+                    ? clampInt(item.l ?? ITEM_LEVEL_MIN, ITEM_LEVEL_MIN, BYTE_MAX)
+                    : ITEM_LEVEL_MIN;
+                const accum = (typeof item === 'object' && item) ? toFiniteNumber(item.a, 0) : 0;
+                const enhancements = (typeof item === 'object' && item) ? sanitizeEnhancements(item.e) : [];
                 if (!name) continue;
-                if (!playerBest[name]) playerBest[name] = { count: 0, level: 1, accum: 0 };
+                if (!playerBest[name]) playerBest[name] = { count: 0, level, accum, enhancements: [] };
                 playerBest[name].count++;
                 if (level > playerBest[name].level) playerBest[name].level = level;
                 if (accum > playerBest[name].accum) playerBest[name].accum = accum;
+                playerBest[name].enhancements = mergeEnhancements(playerBest[name].enhancements, enhancements);
             }
             for (const [name, data] of Object.entries(playerBest)) {
-                if (!modMax[key][name]) modMax[key][name] = { count: 0, level: 1, accum: 0 };
+                if (!modMax[key][name]) {
+                    modMax[key][name] = { count: 0, level: data.level, accum: data.accum, enhancements: [] };
+                }
                 // count: take the max across players (so if two players both have 3×EscalatingShot,
                 //        merged still shows 3, not 6).
                 if (data.count > modMax[key][name].count) modMax[key][name].count = data.count;
@@ -475,6 +503,8 @@ function mergeInventories(room) {
                 if (data.level > modMax[key][name].level) modMax[key][name].level = data.level;
                 // accum: take the highest accumulated buff (relics accumulate over time).
                 if (data.accum > modMax[key][name].accum) modMax[key][name].accum = data.accum;
+                // enhancements: preserve all enum values observed for this item name.
+                modMax[key][name].enhancements = mergeEnhancements(modMax[key][name].enhancements, data.enhancements);
             }
         }
         if (inv.slots) {
@@ -487,13 +517,18 @@ function mergeInventories(room) {
         }
     }
 
-    // Output merged mod arrays in the new {n, l, a} object format.
+    merged.crystals = clampInt(merged.crystals, 0, UINT32_MAX);
+    for (const k of ['weaponMods', 'abilityMods', 'meleeMods', 'perks']) {
+        merged.slots[k] = clampInt(merged.slots[k], 0, BYTE_MAX);
+    }
+
+    // Output merged mod arrays in the new {n, l, a, e} object format.
     // The client's parseItemArray decoder handles both this and the legacy string format,
-    // but sending the full object ensures Level and AccumulatedBuff round-trip correctly.
+    // but sending the full object ensures CrabInventoryInfo metadata round-trips correctly.
     for (const key of ['weaponMods', 'abilityMods', 'meleeMods', 'perks', 'relics']) {
         for (const [name, data] of Object.entries(modMax[key])) {
             for (let i = 0; i < data.count; i++) {
-                merged[key].push({ n: name, l: data.level, a: data.accum });
+                merged[key].push({ n: name, l: data.level, a: data.accum, e: data.enhancements });
             }
         }
     }
@@ -913,10 +948,14 @@ function pill(text,cls){
 function pillList(arr,cls){
   if(!arr||!arr.length) return '<span class="none">&mdash;</span>';
   return arr.map(function(x){
-    // Items are now {n,l,a} objects; fall back to plain strings for legacy payloads.
+    // Items are now {n,l,a,e} objects; fall back to plain strings for legacy payloads.
     var name = (x && typeof x === 'object') ? (x.n || '?') : String(x);
-    var lvl  = (x && typeof x === 'object' && x.l > 1) ? ' <sup>×'+x.l+'</sup>' : '';
-    return '<span class="pill '+cls+'">'+esc(name)+lvl+'</span>';
+    var meta = [];
+    if(x && typeof x === 'object' && x.l > 1) meta.push('L'+x.l);
+    if(x && typeof x === 'object' && x.a) meta.push('A'+x.a);
+    if(x && typeof x === 'object' && Array.isArray(x.e) && x.e.length) meta.push('E['+x.e.join(',')+']');
+    var suffix = meta.length ? ' <small>'+esc(meta.join(' '))+'</small>' : '';
+    return '<span class="pill '+cls+'">'+esc(name)+suffix+'</span>';
   }).join('');
 }
 function row(label,html){

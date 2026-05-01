@@ -20,9 +20,8 @@ syncRelics      = true
 syncHealth      = true
 syncSlots       = true
 
-# Internal PlayerState property names. If a value always reads as 0,
-# use debug.lua (F8) to find the correct name in your game version.
-# Crystals alternatives: CrystalCount, GoldCount, Currency
-# Health alternatives:   CurrentHealth, MaxHealth, HP
+# Internal PlayerState property name for crystals.
+# Health is not configured by property name: current HP is read from
+# CrabHC.HealthInfo.CurrentHealth and max HP from CrabHC.HealthInfo.CurrentMaxHealth.
+# Armor plates are intentionally not synced yet.
 crystalsProperty = Crystals
-healthProperty   = Health

@@ -220,7 +220,34 @@ local function onF8()
         end
     end
 
-    -- Helper to print a mod/perk array
+    local function clampByte(n)
+        local value = math.floor(tonumber(n) or 0)
+        if value < 0 then return 0 end
+        if value > 255 then return 255 end
+        return value
+    end
+
+    local function readEnhancements(info)
+        local out = {}
+        if not info or not info.Enhancements then return out end
+        pcall(function()
+            info.Enhancements:ForEach(function(_, elem)
+                local raw = elem
+                local okGet, value = pcall(function() return elem:get() end)
+                if okGet then raw = value end
+                local okNumber, numberValue = pcall(function() return tonumber(raw) end)
+                if not okNumber then numberValue = nil end
+                if not numberValue then
+                    local text = tostring(raw)
+                    numberValue = tonumber(text) or tonumber(text:match("(%d+)$"))
+                end
+                if numberValue then table.insert(out, clampByte(numberValue)) end
+            end)
+        end)
+        return out
+    end
+
+    -- Helper to print a mod/perk array, including CrabInventoryInfo metadata.
     local function printArray(label, propName, daField)
         pcall(function()
             local arr = ps:GetPropertyValue(propName)
@@ -230,11 +257,27 @@ local function onF8()
             end
             local items = {}
             arr:ForEach(function(_, elem)
-                if elem:get():IsValid() then
-                    local okd, da = pcall(function() return elem:get()[daField] end)
+                local okSlot, slot = pcall(function() return elem:get() end)
+                if okSlot and slot:IsValid() then
+                    local okd, da = pcall(function() return slot[daField] end)
                     if okd and da then
                         local okn, n = pcall(function() return da.Name:ToString() end)
-                        table.insert(items, okn and n or "?")
+                        local level, accum, enhancements = 1, 0.0, {}
+                        pcall(function()
+                            local info = slot.InventoryInfo
+                            if info then
+                                level = clampByte(info.Level)
+                                if level < 1 then level = 1 end
+                                accum = tonumber(info.AccumulatedBuff) or 0.0
+                                enhancements = readEnhancements(info)
+                            end
+                        end)
+                        table.insert(items, string.format(
+                            "%s (level=%d, accumulatedBuff=%.4f, enhancements=[%s])",
+                            okn and n or "?",
+                            level,
+                            accum,
+                            table.concat(enhancements, ",")))
                     end
                 end
             end)

@@ -2,16 +2,17 @@
 
 Real-time shared inventory sync for **Crab Champions** co-op — a three-tier Lua / PowerShell / Node.js architecture.
 
+> **⚠️ Beta — known crash:** Joining another player's game while this mod is installed will crash your client. Host-only sessions work. See [Known Issues](#known-issues).
 
 ## How it works
 
 1. All players install the `Mods/CrabInventorySync/` folder into their UE4SS `Mods/` directory and set the same `roomCode` in `Scripts/config.txt` (or let auto-detection handle it — the room is derived from the session host's player name automatically).
 2. On mod load, `bridge.ps1` is auto-launched as a PowerShell window.
-3. Every 500 ms the mod reads your inventory and writes `push.json` if anything changed.
+3. Every 500 ms the mod reads your inventory and writes `push_<instance>.json` if anything changed.
 4. The bridge detects the file change and POSTs it to the relay server.
-5. The server merges all players' inventories (sum of crystals, health, mods, perks, relics; newest player wins for weapon/ability/melee; max wins for slot counts).
-6. The bridge writes the merged result to `recv.json`.
-7. Every player reads `recv.json` and applies it to their own character.
+5. The server merges all players' inventories (sum of crystals, health, and slot contributions; merged mods, perks, and relics; newest changed weapon/ability/melee wins).
+6. The bridge writes the merged result to `recv_<instance>.json`.
+7. Every player reads `recv_<instance>.json` and applies it to their own character.
 
 No "host" designation required — each client manages itself.
 
@@ -67,6 +68,23 @@ Edit `Mods/CrabInventorySync/Scripts/config.txt`:
 | `syncSlots` | `true` | Sync mod/perk slot counts (SetPropertyValue only — no UFunctions) |
 | `crystalsProperty` | `Crystals` | Internal PlayerState property name for crystals |
 
+Runtime IPC files are per game launch: `push_<instance>.json` and
+`recv_<instance>.json`. Running `bridge.ps1` manually without an instance ID
+still uses legacy `push.json` and `recv.json` paths for debugging.
+
+There is no `healthProperty` config key. Current HP is read from
+`CrabHC.HealthInfo.CurrentHealth`; max HP is read from
+`CrabHC.HealthInfo.CurrentMaxHealth`. Armor plates are currently local-only.
+
+Keys are not synced. Item payloads preserve `InventoryInfo.Level`,
+`InventoryInfo.AccumulatedBuff`, and `InventoryInfo.Enhancements` as `e`. The
+apply gate compares the full item metadata signature, so reorder-only changes
+are ignored while level, buff, and enhancement differences are detected. When
+live and incoming item names/counts can be paired safely, the client applies
+scalar `Level` and `AccumulatedBuff` updates to existing slots. It still does
+not write nested enhancement TArrays back into item slots until that path has
+in-game-safe write testing.
+
 ## Server dashboard
 
 The relay server hosts a live dashboard at the root URL (e.g. `https://crab.dudiebug.net`). It shows:
@@ -74,6 +92,37 @@ The relay server hosts a live dashboard at the root URL (e.g. `https://crab.dudi
 - All active rooms and their session members (connected vs. expected)
 - The merged inventory for each room
 - Per-player inventory contributions with freshness indicators
+
+## Server deploy
+
+The production VPS currently runs a flat service layout:
+
+- `WorkingDirectory=/opt/crab-sync`
+- `ExecStart=/usr/bin/node server.js 3000`
+- service name: `crab-sync`
+
+The repo stores the Node app in `server/`, so `server/deploy-flat.sh` updates
+`server/`, copies it into the flat service root, installs dependencies, checks
+`server.js`, and restarts the service.
+
+First install on the VPS:
+
+```bash
+cd /opt/crab-sync
+git init
+git remote add origin https://github.com/Dudiebug/CrabInvSync.git 2>/dev/null || true
+git fetch origin master
+git checkout -f origin/master -- server
+cp -a server/. .
+bash deploy-flat.sh
+```
+
+Future deploys:
+
+```bash
+cd /opt/crab-sync
+bash deploy-flat.sh
+```
 
 ## Keybinds
 
