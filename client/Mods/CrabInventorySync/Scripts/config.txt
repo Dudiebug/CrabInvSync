@@ -17,11 +17,15 @@ syncAbilityMods = true
 syncMeleeMods   = true
 syncPerks       = true
 syncRelics      = true
-syncHealth      = true
+
+# Health sync has a readiness gate in main.lua, but keep it disabled for the
+# current solo inventory test build until health startup reads are verified in-game.
+syncHealth      = false
 syncSlots       = true
 
 # Internal PlayerState property name for crystals.
 # Health is not configured by property name: current HP is read from
 # CrabHC.HealthInfo.CurrentHealth and max HP from CrabHC.HealthInfo.CurrentMaxHealth.
+# When syncHealth is false, the client does not read, send, or apply health.
 # Armor plates are intentionally not synced yet.
 crystalsProperty = Crystals

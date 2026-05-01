@@ -59,7 +59,7 @@ Edit `Mods/CrabInventorySync/Scripts/config.txt`:
 | `syncAbility` | `true` | Sync ability slot |
 | `syncMelee` | `true` | Sync melee slot |
 | `syncCrystals` | `true` | Sync crystal pool |
-| `syncHealth` | `true` | Sync health pool |
+| `syncHealth` | `false` | Experimental health pool sync; keep disabled until readiness is verified in-game |
 | `syncWeaponMods` | `true` | Sync weapon mods |
 | `syncAbilityMods` | `true` | Sync ability mods |
 | `syncMeleeMods` | `true` | Sync melee mods |
@@ -74,7 +74,8 @@ still uses legacy `push.json` and `recv.json` paths for debugging.
 
 There is no `healthProperty` config key. Current HP is read from
 `CrabHC.HealthInfo.CurrentHealth`; max HP is read from
-`CrabHC.HealthInfo.CurrentMaxHealth`. Armor plates are currently local-only.
+`CrabHC.HealthInfo.CurrentMaxHealth`. When `syncHealth=false`, the client does
+not read, send, or apply health. Armor plates are currently local-only.
 
 Keys are not synced. Item payloads preserve `InventoryInfo.Level`,
 `InventoryInfo.AccumulatedBuff`, and `InventoryInfo.Enhancements` as `e`. The
@@ -145,6 +146,19 @@ This is a known UE4SS limitation: when a client joins, the game's replication sy
 - Mod slot counts are increased via `SetPropertyValue` only — this is safe but may not persist across map transitions in all configurations.
 - PowerShell 5+ is required (built into Windows 10/11).
 - Room code auto-detection requires a live multiplayer session; solo play uses the fallback `roomCode` from config.
+
+## Install helpers
+
+For a stable test copy from this repo, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-client-to-game.ps1 "C:\Path\To\Crab Champions\Binaries\Win64"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-installed-client.ps1 "C:\Path\To\Crab Champions\Binaries\Win64"
+```
+
+The install helper accepts the game `Win64` folder, the UE4SS `Mods` folder, or
+the final `Mods\CrabInventorySync` folder. It copies only the required
+`CrabInventorySync` files and does not mirror or delete unrelated game files.
 
 ## License
 

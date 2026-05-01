@@ -12,12 +12,21 @@ client/Mods/Keybinds/
 client/Mods/mods.txt
 
 # Runtime-generated IPC files
+push*.json
+recv*.json
+autolaunch.vbs
 client/Mods/CrabInventorySync/Scripts/push*.json
 client/Mods/CrabInventorySync/Scripts/recv*.json
 client/Mods/CrabInventorySync/Scripts/autolaunch.vbs
+**/CrabInventorySync/Scripts/push*.json
+**/CrabInventorySync/Scripts/recv*.json
+**/CrabInventorySync/Scripts/autolaunch.vbs
 
 # Log files
+*.log
 client/Mods/CrabInventorySync/Scripts/*.log
+**/CrabInventorySync/Scripts/*.log
+server/*.jsonl
 
 # Local game install copies and diagnostics
 /MyMods/

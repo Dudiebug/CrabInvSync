@@ -159,10 +159,7 @@ setInterval(() => {
             if ((data.lastSeen || data.updatedAt) < cutoff) {
                 // Timeout: ghost the player (same as a graceful /leave) rather than hard-
                 // deleting, so their crystal / slot contribution is not instantly erased.
-                if (data.inventory) {
-                    data.inventory.health    = 0;
-                    data.inventory.maxHealth = 0;
-                }
+                invalidateHealth(data.inventory);
                 data.ghost  = true;
                 data.leftAt = Date.now();
                 srvLog('CLEANUP', `Ghosted timed-out player "${name}"`, { room: code });
@@ -230,6 +227,11 @@ function toFiniteNumber(value, fallback = 0) {
     return Number.isFinite(n) ? n : fallback;
 }
 
+function toOptionalFiniteNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
 function clampInt(value, min, max) {
     return Math.max(min, Math.min(max, Math.floor(toFiniteNumber(value, min))));
 }
@@ -275,17 +277,58 @@ function sanitizeItemArray(items) {
     return out;
 }
 
-function sanitizeInventory(inventory) {
+function sanitizeHealthFields(inv, prevInv) {
+    if (inv.healthValid === false) {
+        return { healthValid: false };
+    }
+
+    const hasHealth = Object.prototype.hasOwnProperty.call(inv, 'health');
+    const hasMaxHealth = Object.prototype.hasOwnProperty.call(inv, 'maxHealth');
+    if (!hasHealth && !hasMaxHealth) {
+        return { healthValid: false };
+    }
+    if (!hasHealth || !hasMaxHealth) {
+        return { healthValid: false };
+    }
+
+    const health = toOptionalFiniteNumber(inv.health);
+    const maxHealth = toOptionalFiniteNumber(inv.maxHealth);
+    if (health == null || maxHealth == null || health < 0 || maxHealth <= 0) {
+        return { healthValid: false };
+    }
+
+    const hadPriorValidHealth = !!(prevInv && (prevInv.healthEverValid || (prevInv.healthValid && prevInv.health > 0)));
+    if (health === 0 && !hadPriorValidHealth) {
+        return { healthValid: false };
+    }
+
+    return {
+        healthValid: true,
+        health: Math.max(0, health),
+        maxHealth: Math.max(0, maxHealth),
+    };
+}
+
+function invalidateHealth(inventory) {
+    if (!inventory) return;
+    delete inventory.health;
+    delete inventory.maxHealth;
+    inventory.healthValid = false;
+    inventory.healthEverValid = false;
+}
+
+function sanitizeInventory(inventory, prevInv = null) {
     const inv = (inventory && typeof inventory === 'object') ? inventory : {};
     const cleanName = (v) => (typeof v === 'string' ? v : '');
     const slots = (inv.slots && typeof inv.slots === 'object') ? inv.slots : {};
-    return {
+    const healthFields = sanitizeHealthFields(inv, prevInv);
+    const out = {
         weapon: cleanName(inv.weapon),
         ability: cleanName(inv.ability),
         melee: cleanName(inv.melee),
         crystals: clampInt(inv.crystals ?? 0, 0, UINT32_MAX),
-        health: Math.max(0, toFiniteNumber(inv.health, 0)),
-        maxHealth: Math.max(0, toFiniteNumber(inv.maxHealth, 0)),
+        healthValid: healthFields.healthValid,
+        healthEverValid: !!(prevInv && prevInv.healthEverValid),
         weaponMods: sanitizeItemArray(inv.weaponMods),
         abilityMods: sanitizeItemArray(inv.abilityMods),
         meleeMods: sanitizeItemArray(inv.meleeMods),
@@ -298,6 +341,12 @@ function sanitizeInventory(inventory) {
             perks: clampInt(slots.perks ?? 0, 0, BYTE_MAX),
         },
     };
+    if (healthFields.healthValid) {
+        out.health = healthFields.health;
+        out.maxHealth = healthFields.maxHealth;
+        if (healthFields.health > 0) out.healthEverValid = true;
+    }
+    return out;
 }
 
 function normalizeIdentifier(value, maxLen = MAX_IDENTIFIER_LEN) {
@@ -443,8 +492,7 @@ function mergeInventories(room) {
         ability:     pickField('ability', 'abilityChangedAt'),
         melee:       pickField('melee',   'meleeChangedAt'),
         crystals:    0,
-        health:      0,
-        maxHealth:   0,
+        healthValid: false,
         weaponMods:  [],
         abilityMods: [],
         meleeMods:   [],
@@ -464,16 +512,23 @@ function mergeInventories(room) {
         relics:      {},
     };
 
+    let mergedHealth = 0;
+    let mergedMaxHealth = 0;
+    let validHealthContributors = 0;
+
     for (const p of players) {
         const inv = p.inventory;
         if (!inv) continue;
         if (inv.crystals) merged.crystals += inv.crystals;
-        if (inv.health)    merged.health    += inv.health;
+        if (inv.healthValid) {
+            mergedHealth += inv.health || 0;
+            mergedMaxHealth += inv.maxHealth || 0;
+            validHealthContributors++;
+        }
         // maxHealth: SUM contributions from each player (delta-tracked on client).
         // Two players each contributing 250 maxHP → merged 500 maxHP for everyone.
         // Items that boost maxHP are already shared via item sync, so the maxHealth
         // pool naturally reflects perk bonuses without double-counting.
-        if (inv.maxHealth) merged.maxHealth += inv.maxHealth;
         for (const key of ['weaponMods', 'abilityMods', 'meleeMods', 'perks', 'relics']) {
             // Each element is either a legacy plain string or a {n, l, a, e} object.
             // Normalise to { name, level, accum, enhancements } then merge into modMax.
@@ -518,6 +573,11 @@ function mergeInventories(room) {
     }
 
     merged.crystals = clampInt(merged.crystals, 0, UINT32_MAX);
+    if (validHealthContributors > 0) {
+        merged.health = Math.max(0, mergedHealth);
+        merged.maxHealth = Math.max(0, mergedMaxHealth);
+        merged.healthValid = true;
+    }
     for (const k of ['weaponMods', 'abilityMods', 'meleeMods', 'perks']) {
         merged.slots[k] = clampInt(merged.slots[k], 0, BYTE_MAX);
     }
@@ -552,13 +612,13 @@ app.post('/push', (req, res) => {
 
     const r = getRoom(roomCode);
     const now = Date.now();
-    const cleanInventory = sanitizeInventory(inventory);
+    const prev = r[playerName];
+    const prevInv = prev && prev.inventory;
+    const cleanInventory = sanitizeInventory(inventory, prevInv);
     // Per-field change timestamps for weapon / ability / melee.
     // If the player's new value differs from what they last pushed, bump the timestamp
     // so mergeInventories can pick the most recently changed value per-field across
     // all players, rather than all-or-nothing from the most recent overall pusher.
-    const prev = r[playerName];
-    const prevInv = prev && prev.inventory;
     const weaponChangedAt  = (prevInv && prevInv.weapon  === cleanInventory.weapon)  ? (prev.weaponChangedAt  || now) : now;
     const abilityChangedAt = (prevInv && prevInv.ability === cleanInventory.ability) ? (prev.abilityChangedAt || now) : now;
     const meleeChangedAt   = (prevInv && prevInv.melee   === cleanInventory.melee)   ? (prev.meleeChangedAt   || now) : now;
@@ -590,7 +650,9 @@ app.post('/push', (req, res) => {
         ability: cleanInventory.ability || '(none)',
         melee: cleanInventory.melee || '(none)',
         crystals: cleanInventory.crystals ?? 0,
-        health: cleanInventory.health ?? 0,
+        healthValid: cleanInventory.healthValid,
+        health: cleanInventory.health,
+        maxHealth: cleanInventory.maxHealth,
         wMods: (cleanInventory.weaponMods || []).length,
         aMods: (cleanInventory.abilityMods || []).length,
         mMods: (cleanInventory.meleeMods || []).length,
@@ -647,10 +709,7 @@ app.post('/leave', (req, res) => {
         // The ghost is cleaned up by the normal stale-player sweep once the room
         // becomes idle, or immediately if the room has no other live players.
         const entry = r[playerName];
-        if (entry.inventory) {
-            entry.inventory.health    = 0;
-            entry.inventory.maxHealth = 0;
-        }
+        invalidateHealth(entry.inventory);
         entry.ghost    = true;
         entry.leftAt   = Date.now();
         srvLog('LEAVE', `"${playerName}" ghosted in room "${roomCode}" — pool contribution frozen`);

@@ -239,6 +239,11 @@ local function jsonNumber(n, decimals)
     return s:gsub(",", ".")
 end
 
+local function isFiniteNumber(n)
+    local num = tonumber(n)
+    return num ~= nil and num == num and num ~= math.huge and num ~= -math.huge
+end
+
 local function clampInt(n, minValue, maxValue)
     local value = math.floor(tonumber(n) or minValue)
     if value < minValue then return minValue end
@@ -366,27 +371,34 @@ end
 
 local function encodeInventory(inv)
     local sl = inv.slots or { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
-    return string.format(
-        '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,' ..
-        '"health":%s,"maxHealth":%s,' ..
-        '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s,' ..
-        '"slots":{"weaponMods":%d,"abilityMods":%d,"meleeMods":%d,"perks":%d}}',
-        jsonStr(inv.weapon),
-        jsonStr(inv.ability),
-        jsonStr(inv.melee),
-        clampInt(inv.crystals, 0, UINT32_MAX),
-        jsonNumber(inv.health, 3),
-        jsonNumber(inv.maxHealth, 3),
-        jsonItemArray(inv.weaponMods),
-        jsonItemArray(inv.abilityMods),
-        jsonItemArray(inv.meleeMods),
-        jsonItemArray(inv.perks),
-        jsonItemArray(inv.relics),
+    local parts = {
+        '"weapon":' .. jsonStr(inv.weapon),
+        '"ability":' .. jsonStr(inv.ability),
+        '"melee":' .. jsonStr(inv.melee),
+        '"crystals":' .. tostring(clampInt(inv.crystals, 0, UINT32_MAX)),
+    }
+
+    if inv.healthValid == true and inv.health ~= nil and inv.maxHealth ~= nil then
+        table.insert(parts, '"healthValid":true')
+        table.insert(parts, '"health":' .. jsonNumber(inv.health, 3))
+        table.insert(parts, '"maxHealth":' .. jsonNumber(inv.maxHealth, 3))
+    elseif inv.healthValid == false then
+        table.insert(parts, '"healthValid":false')
+    end
+
+    table.insert(parts, '"weaponMods":' .. jsonItemArray(inv.weaponMods))
+    table.insert(parts, '"abilityMods":' .. jsonItemArray(inv.abilityMods))
+    table.insert(parts, '"meleeMods":' .. jsonItemArray(inv.meleeMods))
+    table.insert(parts, '"perks":' .. jsonItemArray(inv.perks))
+    table.insert(parts, '"relics":' .. jsonItemArray(inv.relics))
+    table.insert(parts, string.format(
+        '"slots":{"weaponMods":%d,"abilityMods":%d,"meleeMods":%d,"perks":%d}',
         clampInt(sl.weaponMods, 0, BYTE_MAX),
         clampInt(sl.abilityMods, 0, BYTE_MAX),
         clampInt(sl.meleeMods, 0, BYTE_MAX),
         clampInt(sl.perks, 0, BYTE_MAX)
-    )
+    ))
+    return "{" .. table.concat(parts, ",") .. "}"
 end
 
 -- Minimal JSON decoder for the specific inventory structure we produce.
@@ -401,8 +413,19 @@ local function decodeInventory(json)
     inv.ability   = json:match('"ability"%s*:%s*"([^"]*)"') or ""
     inv.melee     = json:match('"melee"%s*:%s*"([^"]*)"')   or ""
     inv.crystals  = clampInt(json:match('"crystals"%s*:%s*(%d+)'), 0, UINT32_MAX)
-    inv.health    = tonumber(json:match('"health"%s*:%s*(%-?[%d%.]+)'))     or 0.0
-    inv.maxHealth = tonumber(json:match('"maxHealth"%s*:%s*(%-?[%d%.]+)'))  or 0.0
+
+    local healthFlag = json:match('"healthValid"%s*:%s*(%a+)')
+    local healthRaw = tonumber(json:match('"health"%s*:%s*(%-?[%d%.]+)'))
+    local maxHealthRaw = tonumber(json:match('"maxHealth"%s*:%s*(%-?[%d%.]+)'))
+    if healthFlag == "false" then
+        inv.healthValid = false
+    elseif healthRaw ~= nil or maxHealthRaw ~= nil then
+        inv.health = healthRaw
+        inv.maxHealth = maxHealthRaw
+        inv.healthValid = true
+    else
+        inv.healthValid = false
+    end
 
     inv.weaponMods  = parseItemArray(json, "weaponMods")
     inv.abilityMods = parseItemArray(json, "abilityMods")
@@ -893,6 +916,7 @@ local equipHealthZeroReadsRemaining = 0
 local ownCrystals, lastGameCrystals
 local ownHealth, lastGameHealth
 local ownMaxHealth, lastGameMaxHealth
+local hasConfirmedValidHealthSample = false
 local ownSlots      = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
 local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil }
 
@@ -912,7 +936,7 @@ local emptyReadStreak   = {}   -- cat.inv -> consecutive empty-read count
 local function readInventory(ps)
     local inv = {
         weapon = "", ability = "", melee = "",
-        crystals = 0, keys = 0, health = 0, maxHealth = 0,
+        crystals = 0, keys = 0,
         weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {},
         slots = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     }
@@ -983,20 +1007,53 @@ local function readInventory(ps)
     end
 
     if SYNC_HEALTH then
+        inv.healthValid = false
         pcall(function()
             local hc = getLocalHC()
-            if not hc then return end
+            if not hc then
+                print("[CrabSync:health] health read skipped: HC not ready\n")
+                return
+            end
             local hi = hc:GetPropertyValue("HealthInfo")
-            if not hi then return end
+            if not hi then
+                print("[CrabSync:health] health read skipped: HealthInfo not ready\n")
+                return
+            end
             local ignoreHealthZeroThisRead = (equipHealthZeroReadsRemaining > 0)
             -- HealthInfo is a struct: direct field access only (no GetPropertyValue).
             -- Field names from object dump section 5 (CrabHealthInfo):
             --   0x0C  CurrentHealth     - the real live HP value
             --   0x10  CurrentMaxHealth  - effective max HP (BaseMaxHealth * MaxHealthMultiplier)
             -- NOTE: there is NO field named "MaxHealth" on CrabHealthInfo.
-            -- Delta-track current HP.
             local raw = hi.CurrentHealth
-            if raw and raw > 0 then
+            local maxRaw = hi.CurrentMaxHealth
+
+            if not isFiniteNumber(maxRaw) or tonumber(maxRaw) <= 0 then
+                print("[CrabSync:health] health read skipped: HealthInfo not ready\n")
+                return
+            end
+            if not isFiniteNumber(raw) then
+                print("[CrabSync:health] health read skipped: HealthInfo not ready\n")
+                return
+            end
+
+            raw = tonumber(raw)
+            maxRaw = tonumber(maxRaw)
+            if raw == 0 and ignoreHealthZeroThisRead then
+                print("[CrabSync:health] health read skipped: startup zero\n")
+                equipHealthZeroReadsRemaining = math.max(0, equipHealthZeroReadsRemaining - 1)
+                return
+            end
+            if raw == 0 and not hasConfirmedValidHealthSample then
+                print("[CrabSync:health] health read skipped: startup zero\n")
+                return
+            end
+
+            if raw > 0 then
+                hasConfirmedValidHealthSample = true
+            end
+
+            if raw > 0 then
                 if lastGameHealth == nil then
                     ownHealth      = raw
                     lastGameHealth = raw
@@ -1012,44 +1069,33 @@ local function readInventory(ps)
                         lastGameHealth = raw
                     end
                 end
-            elseif raw == 0 then
-                if ignoreHealthZeroThisRead then
-                    print("[CrabSync:health] Ignoring transient CurrentHealth=0 during lobby-equip grace.\n")
-                else
-                    -- Player is dead. Anchor to 0 so respawn delta is counted correctly.
-                    ownHealth      = 0
-                    lastGameHealth = 0
-                end
+            else
+                -- Player is dead. Anchor to 0 so respawn delta is counted correctly.
+                ownHealth      = 0
+                lastGameHealth = 0
             end
-            -- Always report the last known contribution (never the 0 default).
-            if ownHealth then inv.health = ownHealth end
 
-            -- Delta-track max HP with the same re-init guard.
-            local maxRaw = hi.CurrentMaxHealth
-            if maxRaw and maxRaw > 0 then
-                if lastGameMaxHealth == nil then
+            if lastGameMaxHealth == nil then
+                ownMaxHealth      = maxRaw
+                lastGameMaxHealth = maxRaw
+            else
+                local maxDelta  = maxRaw - lastGameMaxHealth
+                local newMaxOwn = (ownMaxHealth or 0) + maxDelta
+                if newMaxOwn <= 0 then
                     ownMaxHealth      = maxRaw
                     lastGameMaxHealth = maxRaw
                 else
-                    local maxDelta  = maxRaw - lastGameMaxHealth
-                    local newMaxOwn = (ownMaxHealth or 0) + maxDelta
-                    if newMaxOwn <= 0 then
-                        ownMaxHealth      = maxRaw
-                        lastGameMaxHealth = maxRaw
-                    else
-                        ownMaxHealth      = newMaxOwn
-                        lastGameMaxHealth = maxRaw
-                    end
-                end
-            elseif maxRaw == 0 then
-                if ignoreHealthZeroThisRead then
-                    print("[CrabSync:health] Ignoring transient CurrentMaxHealth=0 during lobby-equip grace.\n")
-                else
-                    ownMaxHealth      = 0
-                    lastGameMaxHealth = 0
+                    ownMaxHealth      = newMaxOwn
+                    lastGameMaxHealth = maxRaw
                 end
             end
-            if ownMaxHealth then inv.maxHealth = ownMaxHealth end
+
+            inv.health = ownHealth
+            inv.maxHealth = ownMaxHealth
+            inv.healthValid = (ownHealth ~= nil and ownMaxHealth ~= nil)
+            print(string.format(
+                "[CrabSync:health] health read valid: health=%s maxHealth=%s\n",
+                jsonNumber(inv.health, 3), jsonNumber(inv.maxHealth, 3)))
             if equipHealthZeroReadsRemaining > 0 then
                 equipHealthZeroReadsRemaining = equipHealthZeroReadsRemaining - 1
             end
@@ -1133,9 +1179,10 @@ end
 -- INVENTORY APPLY
 -- ============================================================
 local function applyInventory(ps, inv)
-    if not ps or not inv then return end
+    local applyReport = { applied=false, partialSkipped=false }
+    if not ps or not inv then return applyReport end
     local ok, valid = pcall(function() return ps:IsValid() end)
-    if not ok or not valid then return end
+    if not ok or not valid then return applyReport end
 
     local weaponDAs     = SYNC_WEAPON        and FindAllOf("CrabWeaponDA")     or {}
     local abilityDAs    = SYNC_ABILITY       and FindAllOf("CrabAbilityDA")    or {}
@@ -1154,6 +1201,9 @@ local function applyInventory(ps, inv)
             local curWeapon  = getDAName(ps.WeaponDA)
             local curAbility = getDAName(ps.AbilityDA)
             local curMelee   = getDAName(ps.MeleeDA)
+            local emptyRecvW = SYNC_WEAPON  and (inv.weapon  or "") == "" and curWeapon  ~= ""
+            local emptyRecvA = SYNC_ABILITY and (inv.ability or "") == "" and curAbility ~= ""
+            local emptyRecvM = SYNC_MELEE   and (inv.melee   or "") == "" and curMelee   ~= ""
             local newWeapon  = (SYNC_WEAPON  and inv.weapon  ~= "") and inv.weapon  or curWeapon
             local newAbility = (SYNC_ABILITY and inv.ability ~= "") and inv.ability or curAbility
             local newMelee   = (SYNC_MELEE   and inv.melee   ~= "") and inv.melee   or curMelee
@@ -1169,10 +1219,17 @@ local function applyInventory(ps, inv)
             local blockedW = SYNC_WEAPON  and stableWeapon  ~= nil and curWeapon  ~= stableWeapon
             local blockedA = SYNC_ABILITY and stableAbility ~= nil and curAbility ~= stableAbility
             local blockedM = SYNC_MELEE   and stableMelee   ~= nil and curMelee   ~= stableMelee
+            if emptyRecvW or emptyRecvA or emptyRecvM then
+                applyReport.partialSkipped = true
+                print(string.format(
+                    "[CrabSync:apply] partial skip: empty recv equipment ignored over local W=%s A=%s M=%s\n",
+                    tostring(emptyRecvW), tostring(emptyRecvA), tostring(emptyRecvM)))
+            end
             if blockedW then newWeapon  = curWeapon  end
             if blockedA then newAbility = curAbility end
             if blockedM then newMelee   = curMelee   end
             if blockedW or blockedA or blockedM then
+                applyReport.partialSkipped = true
                 print(string.format(
                     "[CrabSync:apply] BLOCKED debounce: W=%s A=%s M=%s\n",
                     tostring(blockedW), tostring(blockedA), tostring(blockedM)))
@@ -1186,6 +1243,7 @@ local function applyInventory(ps, inv)
                     "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
                     newWeapon, newAbility, newMelee))
                 ps:ServerEquipInventory(weapon, ability, melee)
+                applyReport.applied = true
                 equipHealthZeroReadsRemaining = EQUIP_HEALTH_ZERO_GRACE_TICKS
                 print(string.format("[CrabSync:health] Equip apply detected - suppressing zero-health reads for %d tick(s).\n", EQUIP_HEALTH_ZERO_GRACE_TICKS))
                 appliedWeapon  = newWeapon
@@ -1226,18 +1284,57 @@ local function applyInventory(ps, inv)
             if total ~= current then
                 ps:SetPropertyValue(CRYSTALS_PROPERTY, total)
                 lastGameCrystals = total   -- anchor: next read delta = 0
+                applyReport.applied = true
                 pcall(function() ps:OnRep_Crystals() end)
             end
         end)
     end
 
 
-    if SYNC_HEALTH and (inv.health ~= nil or inv.maxHealth ~= nil) then
+    if SYNC_HEALTH then
         pcall(function()
+            if inv.healthValid ~= true or inv.health == nil or inv.maxHealth == nil then
+                print("[CrabSync:health] server/recv health invalid\n")
+                print("[CrabSync:health] health apply skipped\n")
+                applyReport.partialSkipped = true
+                return
+            end
+
+            local mergedHP = math.max(0, math.floor(tonumber(inv.health) or 0))
+            mergedMax = math.max(0, math.floor(tonumber(inv.maxHealth) or 0))
+            if mergedMax <= 0 then
+                print("[CrabSync:health] server/recv health invalid\n")
+                print("[CrabSync:health] health apply skipped\n")
+                applyReport.partialSkipped = true
+                return
+            end
+            if mergedHP == 0 and not hasConfirmedValidHealthSample then
+                print("[CrabSync:health] server/recv health invalid\n")
+                print("[CrabSync:health] health apply skipped\n")
+                applyReport.partialSkipped = true
+                return
+            end
+
             local hc = getLocalHC()
-            if not hc then return end
+            if not hc then
+                print("[CrabSync:health] health apply skipped\n")
+                applyReport.partialSkipped = true
+                return
+            end
             local hi = hc:GetPropertyValue("HealthInfo")
-            if not hi then return end
+            if not hi then
+                print("[CrabSync:health] health apply skipped\n")
+                applyReport.partialSkipped = true
+                return
+            end
+
+            local localMax = nil
+            pcall(function() localMax = tonumber(hi.CurrentMaxHealth) end)
+            if (not hasConfirmedValidHealthSample) and (not isFiniteNumber(localMax) or localMax <= 0) then
+                print("[CrabSync:health] health apply skipped\n")
+                applyReport.partialSkipped = true
+                return
+            end
 
             local didWrite = false
 
@@ -1266,7 +1363,7 @@ local function applyInventory(ps, inv)
             -- so 2 × 250 HP players should each see 500/500, not 250/500.
             -- Always write the merged total so damage taken by any player reduces
             -- everyone's displayed HP — "4 as 1, one takes damage all feel it".
-            local mergedHP = math.max(0, math.floor(tonumber(inv.health) or 0))
+            mergedHP = math.max(0, math.floor(tonumber(inv.health) or 0))
             if mergedHP >= 0 then
                 local currentHP = 0
                 pcall(function() currentHP = math.floor(tonumber(hi.CurrentHealth) or 0) end)
@@ -1278,8 +1375,14 @@ local function applyInventory(ps, inv)
             end
 
             if didWrite then
+                applyReport.applied = true
                 pcall(function() hc:OnRep_HealthInfo() end)
             end
+            print(string.format(
+                "[CrabSync:health] health apply accepted: health=%d maxHealth=%d wrote=%s\n",
+                math.max(0, math.floor(tonumber(inv.health) or 0)),
+                math.max(0, math.floor(tonumber(inv.maxHealth) or 0)),
+                tostring(didWrite)))
         end)
     end
 
@@ -1383,12 +1486,16 @@ local function applyInventory(ps, inv)
                     "[CrabSync:apply] %s reorder-only no-op - item metadata signatures match\n",
                     entry.prop))
             elseif diff.kind == "same" then
-                applyScalarMetadataForPairs(entry.prop, gameItems, recvItems)
+                if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                    applyReport.applied = true
+                end
             elseif diff.metadataMismatch then
                 print(string.format(
                     "[CrabSync:apply] %s metadata differs (%s) - no slot rebuild\n",
                     entry.prop, diff.kind))
-                applyScalarMetadataForPairs(entry.prop, gameItems, recvItems)
+                if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                    applyReport.applied = true
+                end
             elseif diff.slotWriteCandidate then
                 local gameSorted = sortedItemNames(gameItems)
                 local sortedSrc = sortedItemNames(recvItems)
@@ -1425,13 +1532,19 @@ local function applyInventory(ps, inv)
                         entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
                     -- applySlotArray expects a flat name list for its wanted-set logic.
                     applySlotArray(entry.prop, entry.da, entry.list, sortedSrc)
+                    applyReport.applied = true
                     local postWriteItems = getItemsFromPS(ps, entry.prop, entry.da)
-                    applyScalarMetadataForPairs(entry.prop, postWriteItems, recvItems)
+                    if applyScalarMetadataForPairs(entry.prop, postWriteItems, recvItems) then
+                        applyReport.applied = true
+                    end
                 else
                     print(string.format(
                         "[CrabSync:apply] %s name mismatch (%d game / %d recv, slots %d/%d) - no safe slot write\n",
                         entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
-                    applyScalarMetadataForPairs(entry.prop, gameItems, recvItems)
+                    applyReport.partialSkipped = true
+                    if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                        applyReport.applied = true
+                    end
                 end
             end
         end
@@ -1462,11 +1575,13 @@ local function applyInventory(ps, inv)
                         -- readInventory tick sees delta = 0 and does NOT add the synced
                         -- total to ownSlots again (same pattern as crystals / health).
                         lastGameSlots[entry.key] = incoming
+                        applyReport.applied = true
                     end
                 end)
             end
         end
     end
+    return applyReport
 end
 
 -- ============================================================
@@ -1605,7 +1720,8 @@ local function pushIfChanged()
     local ps = getLocalPS()
     if not ps then return end
 
-    local invJson = encodeInventory(readInventory(ps))
+    local inv = readInventory(ps)
+    local invJson = encodeInventory(inv)
     local nowSec = os.time()
     local forcePush = false
     if invJson == lastPushedJson then
@@ -1626,6 +1742,9 @@ local function pushIfChanged()
         lastPushedJson = invJson   -- store only the inv portion for change detection
         lastPushAtSec  = nowSec
         skipNextApply  = true      -- give bridge one tick to process push before we apply
+        if SYNC_HEALTH and inv.healthValid ~= true then
+            print("[CrabSync:health] health omitted from push\n")
+        end
         if forcePush then
             print("[CrabInventorySync] Keepalive push refresh sent to bridge.\n")
         else
@@ -1662,10 +1781,20 @@ local function applyIfChanged()
 
     local ps = getLocalPS()
     if not ps then return end
-    applyInventory(ps, inv)
+    local report = applyInventory(ps, inv) or { applied=false, partialSkipped=false }
     lastRecvJson = json
     lastRecvInvJson = invJson
-    print("[CrabInventorySync] Applied merged inventory to local player.\n")
+    if report.applied then
+        if report.partialSkipped then
+            print("[CrabInventorySync] Applied merged inventory to local player with partial skips.\n")
+        else
+            print("[CrabInventorySync] Applied merged inventory to local player.\n")
+        end
+    elseif report.partialSkipped then
+        print("[CrabSync:apply] apply skipped or partial-only; no inventory writes performed.\n")
+    else
+        print("[CrabSync:apply] merged inventory already matched; no apply needed.\n")
+    end
 end
 
 local function pollTick()
