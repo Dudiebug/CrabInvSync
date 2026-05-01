@@ -50,14 +50,40 @@ local SCRIPT_DIR_PRIMARY   = "Mods/CrabInventorySync/Scripts/"
 local SCRIPT_DIR_SECONDARY = "ue4ss/Mods/CrabInventorySync/Scripts/"
 
 -- File-based IPC with bridge.ps1.
--- Lua writes push.json  → bridge detects change and sends to server via WebSocket.
+-- Lua writes push.json  → bridge detects change and sends to server via HTTP.
 -- Bridge writes recv.json ← server broadcasts merged inventory back.
-local PUSH_FILE = SCRIPT_DIR_PRIMARY .. "push.json"
-local RECV_FILE = SCRIPT_DIR_PRIMARY .. "recv.json"
+--
+-- Per-launch INSTANCE_ID suffix prevents two game instances on the same machine
+-- (split-screen, local co-op testing, multi-account box) from overwriting each
+-- other's push/recv files.  Bridge receives the ID via the autolaunch VBS
+-- and uses matching paths on its side.
+--
+-- os.time() alone isn't enough: two game processes launched in the same second
+-- would produce identical IDs.  We fold in the hex address of a freshly-allocated
+-- table, which differs per Lua VM (and therefore per game process), giving us
+-- effectively-unique IDs without needing OS-level PID access.
+local function makeInstanceId()
+    local addr = tostring({}):match("0x(%x+)") or "0"
+    return string.format("%d_%s", os.time(), addr)
+end
+local INSTANCE_ID = makeInstanceId()
+local PUSH_FILE = SCRIPT_DIR_PRIMARY .. "push_" .. INSTANCE_ID .. ".json"
+local RECV_FILE = SCRIPT_DIR_PRIMARY .. "recv_" .. INSTANCE_ID .. ".json"
 
 -- ============================================================
 -- CONFIG LOADING
 -- ============================================================
+-- Whitespace trim used to clean config values before assignment.
+local function configTrim(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Set to false (with an error log) if the loaded config is missing required
+-- fields or malformed.  pollTick / autoLaunchBridge check this before doing
+-- anything that would fail silently downstream.
+CONFIG_VALID = true
+
 local function loadConfig()
     local configPath = nil
     for _, path in ipairs({ SCRIPT_DIR_PRIMARY .. "config.txt", SCRIPT_DIR_SECONDARY .. "config.txt" }) do
@@ -74,30 +100,70 @@ local function loadConfig()
         return
     end
 
+    -- Known keys → setter.  Keeping this as a table (rather than a chained
+    -- elseif) lets us cheaply detect unknown keys so typos like `syncCristals`
+    -- don't silently turn into "oh that setting just never worked".
+    local setters = {
+        serverUrl        = function(v) SERVER_URL       = v end,
+        roomCode         = function(v) ROOM_CODE        = v end,
+        crystalsProperty = function(v) CRYSTALS_PROPERTY = v end,
+        roomPassword     = function(v) ROOM_PASSWORD    = v end,
+        syncWeapon       = function(v) SYNC_WEAPON       = (v == "true") end,
+        syncAbility      = function(v) SYNC_ABILITY      = (v == "true") end,
+        syncMelee        = function(v) SYNC_MELEE        = (v == "true") end,
+        syncCrystals     = function(v) SYNC_CRYSTALS     = (v == "true") end,
+        syncWeaponMods   = function(v) SYNC_WEAPON_MODS  = (v == "true") end,
+        syncAbilityMods  = function(v) SYNC_ABILITY_MODS = (v == "true") end,
+        syncMeleeMods    = function(v) SYNC_MELEE_MODS   = (v == "true") end,
+        syncPerks        = function(v) SYNC_PERKS        = (v == "true") end,
+        syncRelics       = function(v) SYNC_RELICS       = (v == "true") end,
+        syncHealth       = function(v) SYNC_HEALTH       = (v == "true") end,
+        syncSlots        = function(v) SYNC_SLOTS        = (v == "true") end,
+    }
+
+    local lineNo = 0
     for line in io.lines(configPath) do
-        local key, value = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
-        if key and value then
-            if     key == "serverUrl"        then SERVER_URL           = value
-            elseif key == "roomCode"         then ROOM_CODE            = value
-            elseif key == "syncWeapon"       then SYNC_WEAPON          = (value == "true")
-            elseif key == "syncAbility"      then SYNC_ABILITY         = (value == "true")
-            elseif key == "syncMelee"        then SYNC_MELEE           = (value == "true")
-            elseif key == "syncCrystals"     then SYNC_CRYSTALS        = (value == "true")
-            elseif key == "syncWeaponMods"   then SYNC_WEAPON_MODS     = (value == "true")
-            elseif key == "syncAbilityMods"  then SYNC_ABILITY_MODS    = (value == "true")
-            elseif key == "syncMeleeMods"    then SYNC_MELEE_MODS      = (value == "true")
-            elseif key == "syncPerks"        then SYNC_PERKS           = (value == "true")
-            elseif key == "syncRelics"       then SYNC_RELICS          = (value == "true")
-            elseif key == "syncHealth"       then SYNC_HEALTH          = (value == "true")
-            elseif key == "syncSlots"        then SYNC_SLOTS           = (value == "true")
-            elseif key == "crystalsProperty" then CRYSTALS_PROPERTY    = value
-            elseif key == "roomPassword"     then ROOM_PASSWORD        = value
+        lineNo = lineNo + 1
+        -- Skip blanks and comments (# or ; prefix) without warning noise.
+        local stripped = configTrim(line)
+        if stripped ~= "" and not stripped:match("^[#;]") then
+            local key, value = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+            if key and value then
+                local setter = setters[key]
+                if setter then
+                    setter(value)
+                else
+                    print(string.format(
+                        "[CrabInventorySync] config.txt line %d: unknown key %q — ignoring.\n",
+                        lineNo, key))
+                end
+            else
+                print(string.format(
+                    "[CrabInventorySync] config.txt line %d: malformed (expected `key = value`): %s\n",
+                    lineNo, stripped))
             end
         end
     end
 
+    -- Trim whitespace the user might have left in values.
+    SERVER_URL    = configTrim(SERVER_URL)
+    ROOM_CODE     = configTrim(ROOM_CODE)
+    ROOM_PASSWORD = configTrim(ROOM_PASSWORD)
+
+    -- Hard validation — silent failure here used to mean the bridge launched
+    -- against an unreachable URL and the mod appeared to do nothing.
+    if SERVER_URL == "" then
+        print("[CrabInventorySync] ERROR: serverUrl is empty in config.txt — sync disabled.\n")
+        CONFIG_VALID = false
+    end
+    if ROOM_CODE == "" then
+        print("[CrabInventorySync] ERROR: roomCode is empty in config.txt — sync disabled.\n")
+        CONFIG_VALID = false
+    end
+
     print("[CrabInventorySync] Config loaded:\n")
     print("  roomCode  = " .. ROOM_CODE .. "\n")
+    print("  serverUrl = " .. SERVER_URL .. "\n")
 end
 
 -- ============================================================
@@ -121,16 +187,28 @@ local function jsonStrArray(arr)
     return "[" .. table.concat(parts, ",") .. "]"
 end
 
+local function jsonNumber(n, decimals)
+    local num = tonumber(n) or 0
+    local s
+    if decimals ~= nil then
+        s = string.format("%." .. tostring(decimals) .. "f", num)
+    else
+        s = tostring(num)
+    end
+    -- Lua can honour OS locale for decimal separators; JSON always requires '.'
+    return s:gsub(",", ".")
+end
+
 -- Encode an array of inventory items as JSON objects {n,l,a}.
 -- n = DA name, l = level (ByteProperty, 1-255), a = AccumulatedBuff (float).
 -- This is the new payload format for weaponMods/abilityMods/meleeMods/perks/relics.
 local function jsonItemArray(items)
     local parts = {}
     for _, item in ipairs(items) do
-        table.insert(parts, string.format('{"n":%s,"l":%d,"a":%.4f}',
+        table.insert(parts, string.format('{"n":%s,"l":%d,"a":%s}',
             jsonStr(item.name or ""),
-            math.max(1, math.floor(tonumber(item.level) or 1)),
-            tonumber(item.accum) or 0.0))
+            math.min(255, math.max(1, math.floor(tonumber(item.level) or 1))),
+            jsonNumber(item.accum, 4)))
     end
     return "[" .. table.concat(parts, ",") .. "]"
 end
@@ -181,15 +259,15 @@ local function encodeInventory(inv)
     local sl = inv.slots or { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     return string.format(
         '{"weapon":%s,"ability":%s,"melee":%s,"crystals":%d,' ..
-        '"health":%.3f,"maxHealth":%.3f,' ..
+        '"health":%s,"maxHealth":%s,' ..
         '"weaponMods":%s,"abilityMods":%s,"meleeMods":%s,"perks":%s,"relics":%s,' ..
         '"slots":{"weaponMods":%d,"abilityMods":%d,"meleeMods":%d,"perks":%d}}',
         jsonStr(inv.weapon),
         jsonStr(inv.ability),
         jsonStr(inv.melee),
         math.floor(tonumber(inv.crystals) or 0),
-        tonumber(inv.health)    or 0.0,
-        tonumber(inv.maxHealth) or 0.0,
+        jsonNumber(inv.health, 3),
+        jsonNumber(inv.maxHealth, 3),
         jsonItemArray(inv.weaponMods),
         jsonItemArray(inv.abilityMods),
         jsonItemArray(inv.meleeMods),
@@ -414,6 +492,26 @@ local function getSortedNamesFromPS(ps, propName, daField)
     return names
 end
 
+-- Return (filledSlots, totalSlots) for a TArray inventory property.
+-- A slot is "filled" when it has a readable DA name; empty/unreadable slots still
+-- count toward totalSlots capacity.
+local function getArrayOccupancy(ps, propName, daField)
+    local filled, total = 0, 0
+    pcall(function()
+        local arr = ps:GetPropertyValue(propName)
+        if not arr then return end
+        arr:ForEach(function(_, elem)
+            if not elem:get():IsValid() then return end
+            total = total + 1
+            local ok, da = pcall(function() return elem:get()[daField] end)
+            if not ok or not da then return end
+            local name = getDAName(da)
+            if name ~= "" then filled = filled + 1 end
+        end)
+    end)
+    return filled, total
+end
+
 -- Weapon/ability/melee debounce state.
 -- The game briefly reports a stale ability during ability use (e.g. Black Hole → Grappling
 -- Hook for one tick while the animation plays).  We only promote a new value to "stable"
@@ -430,8 +528,27 @@ local pendingMelee   = nil;  local pendingMCount = 0;  local stableMelee   = nil
 -- Lobby equip path can briefly report CurrentHealth/CurrentMaxHealth as 0 for
 -- 1-2 polls.  Only suppress zero-health reads for a short, equip-triggered window.
 -- This does NOT delay real death outside the equip path.
-local EQUIP_HEALTH_ZERO_GRACE_TICKS = 2   -- ticks (recalculated from POLL_INTERVAL_MS below)
+local EQUIP_HEALTH_ZERO_GRACE_MS    = 1000
+local EQUIP_HEALTH_ZERO_GRACE_TICKS = 2   -- recalculated from POLL_INTERVAL_MS below
 local equipHealthZeroReadsRemaining = 0
+
+-- Forward declarations for delta-tracking state so read/apply helpers below
+-- and the poll-loop code later share the same upvalues.
+local ownCrystals, lastGameCrystals
+local ownHealth, lastGameHealth
+local ownMaxHealth, lastGameMaxHealth
+local ownSlots      = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
+local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil }
+
+-- Transient-empty-read debounce for readItemArray.  TArrays occasionally read as
+-- empty for a single tick while the engine is mid-update (e.g. swapping a mod);
+-- that briefly "unequipped" state would otherwise get pushed to the server and
+-- broadcast to every other player until the next tick corrected it.  We reuse
+-- the previous non-empty read for up to EMPTY_READ_CONFIRM_TICKS consecutive
+-- empty reads; a real unequip is accepted on the tick after that.
+local EMPTY_READ_CONFIRM_TICKS = 2
+local lastNonEmptyItems = {}   -- cat.inv -> previous items[] (only when non-empty)
+local emptyReadStreak   = {}   -- cat.inv -> consecutive empty-read count
 
 -- ============================================================
 -- INVENTORY READ
@@ -488,24 +605,26 @@ local function readInventory(ps)
         inv.melee = stableMelee or ""
     end
 
-    pcall(function()
-        local raw = math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0)
-        if lastGameCrystals == nil then
-            -- First ever read: everything is ours (no sync has happened yet).
-            ownCrystals      = raw
-            lastGameCrystals = raw
-        else
-            -- Only the delta since the last tick (earned / spent) changes our contribution.
-            -- Positive delta  = crystals earned in-game → add to ownCrystals.
-            -- Negative delta  = crystals spent in-game  → subtract from ownCrystals.
-            -- The applied sync total was already baked into lastGameCrystals by
-            -- applyInventory, so the next tick's delta for an uneventful tick is 0.
-            local delta = raw - lastGameCrystals
-            ownCrystals      = math.max(0, (ownCrystals or 0) + delta)
-            lastGameCrystals = raw
-        end
-        inv.crystals = ownCrystals
-    end)
+    if SYNC_CRYSTALS then
+        pcall(function()
+            local raw = math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0)
+            if lastGameCrystals == nil then
+                -- First ever read: everything is ours (no sync has happened yet).
+                ownCrystals      = raw
+                lastGameCrystals = raw
+            else
+                -- Only the delta since the last tick (earned / spent) changes our contribution.
+                -- Positive delta  = crystals earned in-game → add to ownCrystals.
+                -- Negative delta  = crystals spent in-game  → subtract from ownCrystals.
+                -- The applied sync total was already baked into lastGameCrystals by
+                -- applyInventory, so the next tick's delta for an uneventful tick is 0.
+                local delta = raw - lastGameCrystals
+                ownCrystals      = math.max(0, (ownCrystals or 0) + delta)
+                lastGameCrystals = raw
+            end
+            inv.crystals = ownCrystals
+        end)
+    end
 
     if SYNC_HEALTH then
         pcall(function()
@@ -587,13 +706,35 @@ local function readInventory(ps)
     -- so the JSON is deterministic regardless of UE4 TArray internal ordering —
     -- this eliminates the false-positive change detection that caused the shuffle bug.
     for _, cat in ipairs({
-        { inv="weaponMods",  prop="WeaponMods",  da="WeaponModDA"  },
-        { inv="abilityMods", prop="AbilityMods", da="AbilityModDA" },
-        { inv="meleeMods",   prop="MeleeMods",   da="MeleeModDA"   },
-        { inv="perks",       prop="Perks",       da="PerkDA"       },
-        { inv="relics",      prop="Relics",      da="RelicDA"      },
+        { flag=SYNC_WEAPON_MODS,  inv="weaponMods",  prop="WeaponMods",  da="WeaponModDA"  },
+        { flag=SYNC_ABILITY_MODS, inv="abilityMods", prop="AbilityMods", da="AbilityModDA" },
+        { flag=SYNC_MELEE_MODS,   inv="meleeMods",   prop="MeleeMods",   da="MeleeModDA"   },
+        { flag=SYNC_PERKS,        inv="perks",       prop="Perks",       da="PerkDA"       },
+        { flag=SYNC_RELICS,       inv="relics",      prop="Relics",      da="RelicDA"      },
     }) do
-        inv[cat.inv] = readItemArray(ps, cat.prop, cat.da)
+        if cat.flag then
+            local items = readItemArray(ps, cat.prop, cat.da)
+            local key = cat.inv
+            if #items == 0
+               and lastNonEmptyItems[key]
+               and (emptyReadStreak[key] or 0) < EMPTY_READ_CONFIRM_TICKS
+            then
+                -- Suspected transient empty read — reuse last non-empty value
+                -- until we've seen EMPTY_READ_CONFIRM_TICKS consecutive empties.
+                emptyReadStreak[key] = (emptyReadStreak[key] or 0) + 1
+                inv[key] = lastNonEmptyItems[key]
+            else
+                if #items > 0 then
+                    lastNonEmptyItems[key] = items
+                    emptyReadStreak[key]   = 0
+                else
+                    emptyReadStreak[key] = (emptyReadStreak[key] or 0) + 1
+                end
+                inv[key] = items
+            end
+        else
+            inv[cat.inv] = {}
+        end
     end
 
 
@@ -713,13 +854,13 @@ local function applyInventory(ps, inv)
     -- Writing a stale lower total silently deletes crystals the player earned
     -- mid-combat (example: game=200, stale server=150 → apply reduces to 150).
     -- Exception: current == 0 means fresh load / new run, always apply.
-    if SYNC_CRYSTALS and inv.crystals and inv.crystals > 0 then
+    if SYNC_CRYSTALS and inv.crystals ~= nil then
         pcall(function()
             -- CrabPS.Crystals is UInt32Property (dump §2.1 offset 0x470) — unsigned,
             -- range 0–4,294,967,295.  A pooled server total from many players could exceed
             -- that; clamping prevents a wrap-to-near-zero write that would wipe all crystals.
             local UINT32_MAX = 4294967295
-            local total   = math.min(math.floor(inv.crystals), UINT32_MAX)
+            local total   = math.min(math.max(0, math.floor(tonumber(inv.crystals) or 0)), UINT32_MAX)
             local current = math.min(math.floor(tonumber(ps:GetPropertyValue(CRYSTALS_PROPERTY)) or 0), UINT32_MAX)
             -- Always write the merged total, even if it is lower than the current value.
             -- The delta-tracker in readInventory already anchors lastGameCrystals to
@@ -736,7 +877,7 @@ local function applyInventory(ps, inv)
     end
 
 
-    if SYNC_HEALTH and ((inv.health and inv.health > 0) or (inv.maxHealth and inv.maxHealth > 0)) then
+    if SYNC_HEALTH and (inv.health ~= nil or inv.maxHealth ~= nil) then
         pcall(function()
             local hc = getLocalHC()
             if not hc then return end
@@ -750,8 +891,8 @@ local function applyInventory(ps, inv)
             -- at 250 maxHP each → everyone gets 500 maxHP applied.
             -- SetPropertyValue on struct fields bypasses engine clamping, so the game
             -- stores exactly what we write — the delta tracker sees 0 next tick.
-            local mergedMax = math.floor(tonumber(inv.maxHealth) or 0)
-            if mergedMax > 0 then
+            local mergedMax = math.max(0, math.floor(tonumber(inv.maxHealth) or 0))
+            if mergedMax >= 0 then
                 local currentMax = 0
                 pcall(function() currentMax = math.floor(tonumber(hi.CurrentMaxHealth) or 0) end)
                 -- Always write the merged total (not just when increasing).
@@ -770,8 +911,8 @@ local function applyInventory(ps, inv)
             -- so 2 × 250 HP players should each see 500/500, not 250/500.
             -- Always write the merged total so damage taken by any player reduces
             -- everyone's displayed HP — "4 as 1, one takes damage all feel it".
-            local mergedHP = math.floor(tonumber(inv.health) or 0)
-            if mergedHP > 0 then
+            local mergedHP = math.max(0, math.floor(tonumber(inv.health) or 0))
+            if mergedHP >= 0 then
                 local currentHP = 0
                 pcall(function() currentHP = math.floor(tonumber(hi.CurrentHealth) or 0) end)
                 if mergedHP ~= currentHP then
@@ -836,6 +977,7 @@ local function applyInventory(ps, inv)
             for name, count in pairs(wanted) do
                 for _ = 1, count do table.insert(modsToPlace, name) end
             end
+            table.sort(modsToPlace)
 
             -- Pass 2: write unsatisfied mods into dirty slots only.
             -- Slots with correct mods are never touched — their Level and Enhancements
@@ -879,36 +1021,41 @@ local function applyInventory(ps, inv)
             for _, item in ipairs(entry.src) do table.insert(sortedSrc, item.name) end
             table.sort(sortedSrc)
             local gameSorted = getSortedNamesFromPS(ps, entry.prop, entry.da)
-            -- Membership check: only write if a mod currently in-game is missing from
-            -- recv. If recv merely has MORE mods than slots can hold (e.g. 2-player pool
-            -- has 2 mods but this player only has 1 slot), that is expected — do NOT
-            -- rewrite, otherwise the guard fires every tick and never settles.
-            local recvSet = {}
-            for _, name in ipairs(sortedSrc) do recvSet[name] = true end
-            local missingInRecv = false
-            for _, name in ipairs(gameSorted) do
-                if not recvSet[name] then
-                    missingInRecv = true
-                    break
+            if not arraysEqual(gameSorted, sortedSrc) then
+                local gameCounts = {}
+                for _, name in ipairs(gameSorted) do
+                    gameCounts[name] = (gameCounts[name] or 0) + 1
                 end
-            end
-            -- Also write if recv has something new AND the game slot is empty/short
-            -- (i.e. game has fewer unique mods than recv, meaning there's room to add).
-            local gameSet = {}
-            for _, name in ipairs(gameSorted) do gameSet[name] = true end
-            local newInRecv = false
-            for _, name in ipairs(sortedSrc) do
-                if not gameSet[name] then
-                    newInRecv = true
-                    break
+                local recvCounts = {}
+                for _, name in ipairs(sortedSrc) do
+                    recvCounts[name] = (recvCounts[name] or 0) + 1
                 end
-            end
-            if missingInRecv or newInRecv then
-                print(string.format("[CrabSync:apply] %s set changed (%d game / %d recv) — writing slots\n",
-                    entry.prop, #gameSorted, #sortedSrc))
-                -- applySlotArray expects a flat name list for its wanted-set logic.
-                local srcNames = sortedSrc  -- already extracted above
-                applySlotArray(entry.prop, entry.da, entry.list, srcNames)
+
+                local missingInRecv = false
+                for name, count in pairs(gameCounts) do
+                    if (recvCounts[name] or 0) < count then
+                        missingInRecv = true
+                        break
+                    end
+                end
+
+                local newInRecv = false
+                for name, count in pairs(recvCounts) do
+                    if (gameCounts[name] or 0) < count then
+                        newInRecv = true
+                        break
+                    end
+                end
+
+                local filledSlots, totalSlots = getArrayOccupancy(ps, entry.prop, entry.da)
+                local hasVacancy = totalSlots > filledSlots
+                if missingInRecv or (newInRecv and hasVacancy) then
+                    print(string.format(
+                        "[CrabSync:apply] %s changed (%d game / %d recv, slots %d/%d) - writing slots\n",
+                        entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
+                    -- applySlotArray expects a flat name list for its wanted-set logic.
+                    applySlotArray(entry.prop, entry.da, entry.list, sortedSrc)
+                end
             end
         end
     end
@@ -1015,6 +1162,12 @@ end
 --   3. windowStyle=1 = normal visible window so you can see connection status.
 local function autoLaunchBridge()
     local vbsPath = SCRIPT_DIR_PRIMARY .. "autolaunch.vbs"
+    local function vbsEscape(value)
+        return tostring(value or ""):gsub('"', '""')
+    end
+    local serverArg   = vbsEscape(SERVER_URL)
+    local passwordArg = vbsEscape(ROOM_PASSWORD)
+    local instanceArg = vbsEscape(INSTANCE_ID)
 
     local lines = {
         'Dim fso : Set fso = CreateObject("Scripting.FileSystemObject")',
@@ -1022,7 +1175,9 @@ local function autoLaunchBridge()
         'Dim bridgeDir : bridgeDir = fso.GetParentFolderName(scriptDir)',
         'Dim bridgePath : bridgePath = bridgeDir & "\\bridge.ps1"',
         'Dim sh : Set sh = CreateObject("WScript.Shell")',
-        -- Check for already-running bridge.
+        -- Check for already-running bridge WITH THIS INSTANCE_ID.  We only want to
+        -- dedupe against a bridge spawned by this same Lua VM (e.g., if autoLaunch
+        -- somehow re-fires); a bridge for a different game instance must coexist.
         'Dim wmi, procs, proc, running',
         'running = False',
         'On Error Resume Next',
@@ -1030,7 +1185,7 @@ local function autoLaunchBridge()
         'Set procs = wmi.ExecQuery("SELECT * FROM Win32_Process WHERE Name = \'powershell.exe\'")',
         'If Not IsNull(procs) And Not IsEmpty(procs) Then',
         '    For Each proc In procs',
-        '        If InStr(proc.CommandLine, "bridge.ps1") > 0 Then running = True',
+        '        If InStr(proc.CommandLine, "bridge.ps1") > 0 And InStr(proc.CommandLine, "' .. instanceArg .. '") > 0 Then running = True',
         '    Next',
         'End If',
         'On Error GoTo 0',
@@ -1039,7 +1194,7 @@ local function autoLaunchBridge()
         'Dim playerName : playerName = sh.ExpandEnvironmentStrings("%USERNAME%")',
         'Dim q : q = Chr(34)',
         'sh.CurrentDirectory = bridgeDir',
-        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File " & q & bridgePath & q & " " & q & "' .. SERVER_URL .. '" & q & " " & q & playerName & q, 1, False',
+        'sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File " & q & bridgePath & q & " " & q & "' .. serverArg .. '" & q & " " & q & playerName & q & " " & q & "' .. passwordArg .. '" & q & " " & q & "' .. instanceArg .. '" & q, 1, False',
     }
 
     local f = io.open(vbsPath, "w")
@@ -1079,11 +1234,13 @@ end
 -- first tick after the new level loads performs a full fresh sync.
 
 local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
-EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(1000 / POLL_INTERVAL_MS))
+EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(EQUIP_HEALTH_ZERO_GRACE_MS / POLL_INTERVAL_MS))
+local FORCE_PUSH_INTERVAL_SEC = 10  -- periodic refresh push keeps room state alive after reconnects
 
 local lastPushedJson  = ""     -- inventory JSON last written to push.json (change detection)
 local lastRecvJson    = ""     -- raw recv.json text we last read
 local lastRecvInvJson = ""     -- canonical inventory JSON last applied (format-insensitive)
+local lastPushAtSec   = 0      -- os.time() of the last write to push.json
 local isTransitioning = false  -- pauses polling during level transitions
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update recv.json
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
@@ -1099,22 +1256,16 @@ local skipNextApply   = false  -- true for one tick after a push, so bridge can 
 --                    value we wrote with SetPropertyValue inside applyInventory.
 --                    Keeping it in sync with the game state makes the next delta = 0
 --                    immediately after an apply, preventing double-counting.
-local ownCrystals      = nil   -- our contribution to the shared pool (nil = not yet set)
-local lastGameCrystals = nil   -- raw game crystal count at the last read or apply
 
 -- Same delta-tracking pattern for health.
 -- ownHealth reports our HP contribution; lastGameHealth anchors the delta so that
 -- applying the summed pool doesn't inflate our contribution on the next push.
-local ownHealth      = nil   -- our HP contribution (nil = not yet set)
-local lastGameHealth = nil   -- raw game HP at the last read or apply
 
 -- Same delta-tracking pattern for max HP.
 -- ownMaxHealth      : our personal CurrentMaxHealth contribution.
 -- lastGameMaxHealth : raw game CurrentMaxHealth at last read or apply.
 -- Server SUMs maxHealth across players just like current HP, so two players
 -- each at 250 maxHP → merged 500 maxHP applied to everyone.
-local ownMaxHealth      = nil
-local lastGameMaxHealth = nil
 
 -- Same delta-tracking pattern for slot counts.
 -- Each slot key (weaponMods, abilityMods, meleeMods, perks) is tracked independently.
@@ -1122,12 +1273,11 @@ local lastGameMaxHealth = nil
 -- lastGameSlots[k] = raw game slot count at last read or apply (nil = not yet initialised).
 -- The server SUMs contributions from all players, so we must send only our delta,
 -- not the already-synced total (which would cause doubling on every subsequent push).
-local ownSlots      = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
-local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil }
-
-
-
--- Write push.json only when the inventory has actually changed.
+-- NOTE: These are forward-declared above the read/apply helpers so all code paths
+-- share one set of upvalues.
+-- Write push.json when inventory changed, plus a periodic keepalive rewrite.
+-- The keepalive prevents stale ghost state after reconnect/server restart:
+-- unchanged inventory still gets re-advertised every FORCE_PUSH_INTERVAL_SEC.
 -- The file is written as {"room":"...","inventory":{...}} so the bridge can
 -- use the correct room for both push POSTs and sync GETs.
 -- Room code comes from config.txt (ROOM_CODE).
@@ -1137,12 +1287,14 @@ local function pushIfChanged()
     if not ps then return end
 
     local invJson = encodeInventory(readInventory(ps))
-    -- Always log the push evaluation so we can see debounce-stable vs last-pushed.
-    print(string.format(
-        "[CrabSync:push] eval stable=(%s|%s|%s) changed=%s\n",
-        stableWeapon or "?", stableAbility or "?", stableMelee or "?",
-        tostring(invJson ~= lastPushedJson)))
-    if invJson == lastPushedJson then return end
+    local nowSec = os.time()
+    local forcePush = false
+    if invJson == lastPushedJson then
+        if (nowSec - lastPushAtSec) < FORCE_PUSH_INTERVAL_SEC then
+            return
+        end
+        forcePush = true
+    end
 
     -- Wrap inventory with room, session player list, and password.
     local sessionPlayers = getSessionPlayers()
@@ -1153,8 +1305,13 @@ local function pushIfChanged()
         f:write(payload)
         f:close()
         lastPushedJson = invJson   -- store only the inv portion for change detection
+        lastPushAtSec  = nowSec
         skipNextApply  = true      -- give bridge one tick to process push before we apply
-        print("[CrabInventorySync] Change detected — pushed to bridge.\n")
+        if forcePush then
+            print("[CrabInventorySync] Keepalive push refresh sent to bridge.\n")
+        else
+            print("[CrabInventorySync] Change detected — pushed to bridge.\n")
+        end
     end
 end
 
@@ -1202,7 +1359,11 @@ end
 -- HOOKS & KEYBINDS
 -- ============================================================
 loadConfig()
-autoLaunchBridge()
+if CONFIG_VALID then
+    autoLaunchBridge()
+else
+    print("[CrabInventorySync] Bridge not launched due to invalid config. Fix config.txt and restart the game.\n")
+end
 
 -- Pause polling for 4 s during level transitions to avoid the 0xe06d7363 crash
 -- (PlayerState is mid-destruction when this hook fires; defer until safe).
@@ -1212,6 +1373,7 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
     ExecuteWithDelay(4000, function()
         isTransitioning = false
         lastPushedJson  = ""   -- force fresh push in the new level
+        lastPushAtSec   = 0
         lastRecvJson    = ""   -- force fresh apply if recv.json has data
         lastRecvInvJson = ""
         -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
@@ -1231,6 +1393,7 @@ end)
 -- F9: force an immediate re-push and re-apply on the very next tick.
 RegisterKeyBind(Key.F9, function()
     lastPushedJson   = ""
+    lastPushAtSec    = 0
     lastRecvJson     = ""
     lastRecvInvJson  = ""
     -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
@@ -1244,6 +1407,10 @@ end)
 
 -- Kick off the poll loop.  First tick fires after one interval so the game
 -- has a moment to finish initialising before we start reading PlayerState.
-ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+-- Skip entirely if the config couldn't provide a usable server URL / room code —
+-- otherwise we'd spam bridge.log and push.json with writes that can't succeed.
+if CONFIG_VALID then
+    ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+end
 
 print("[CrabInventorySync] Loaded. Syncing every " .. POLL_INTERVAL_MS .. " ms. Press F9 to force.\n")

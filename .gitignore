@@ -19,6 +19,12 @@ client/Mods/CrabInventorySync/Scripts/autolaunch.vbs
 # Log files
 client/Mods/CrabInventorySync/Scripts/*.log
 
+# Local game install copies and diagnostics
+/MyMods/
+/WORKING COPY HERE/
+/WORKING COPY HERE - Copy/
+/logs to look at/
+
 # Server dependencies
 server/node_modules/
 

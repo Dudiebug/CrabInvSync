@@ -28,12 +28,26 @@ const express = require('express');
 const fs      = require('fs');
 const path    = require('path');
 const app  = express();
-const PORT = process.argv[2] ? parseInt(process.argv[2]) : 3000;
+const requestedPort = Number.parseInt(process.argv[2], 10);
+const PORT = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535
+    ? requestedPort
+    : 3000;
+const SHARED_PASSWORD = process.env.CRABSYNC_PASSWORD || '4982904';
+const MAX_IDENTIFIER_LEN = 96;
+const MAX_SESSION_LEN = 128;
+const MAX_LOG_BATCH_PER_PUSH = 500;
+const MAX_LOG_STRING_LEN = 2048;
 
 const LOGS_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR);
 
 app.use(express.json({ limit: '5mb' }));   // increased for log payloads
+app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Invalid JSON body' });
+    }
+    return next(err);
+});
 
 // ============================================================
 // DATA STORES
@@ -58,19 +72,16 @@ const serverLogs = [];
         for (const file of files) {
             if (file === '__server.jsonl') continue;
             // Filename format: room__player__session.jsonl
-            // room and player may contain __ so we split from the right by known session pattern
+            // New files URI-encode each token; legacy files may be raw.
             const base = file.slice(0, -6); // strip .jsonl
-            // Session ID format: YYYYMMDD-HHMMSS — always last two __-separated parts
             const parts = base.split('__');
             if (parts.length < 3) continue;
-            const session = parts.slice(-2).join('-').replace('-', '-'); // rejoin YYYYMMDD-HHMMSS
-            // Actually session is stored as parts[-2] + '__' + parts[-1]? No — session is "20260321-143052"
-            // The session has no __ so it occupies exactly 1 part. player has no __ (it's a gamertag).
-            // Format: {room}__{player}__{session}.jsonl
-            // Since room could theoretically have __ we split as: everything before last two parts
-            const sess    = parts[parts.length - 1];
-            const player  = parts[parts.length - 2];
-            const room    = parts.slice(0, parts.length - 2).join('__');
+            const sessToken   = parts[parts.length - 1];
+            const playerToken = parts[parts.length - 2];
+            const roomToken   = parts.slice(0, parts.length - 2).join('__');
+            const sess    = decodeLogToken(sessToken);
+            const player  = decodeLogToken(playerToken);
+            const room    = decodeLogToken(roomToken);
             if (!room || !player || !sess) continue;
             const content = fs.readFileSync(path.join(LOGS_DIR, file), 'utf8');
             const entries = content.split('\n').filter(Boolean).map(line => {
@@ -103,7 +114,12 @@ const serverLogs = [];
     }
 })();
 
-const STALE_MS     = 10_000;   // exclude from merge after 10s
+// Client pushes a keepalive every FORCE_PUSH_INTERVAL_SEC (currently 10s in
+// main.lua).  STALE_MS must be strictly GREATER than that interval, or a slow
+// network hop / bridge tick jitter can make the keepalive arrive after we've
+// already excluded the player from the merge — producing intermittent
+// disappearing-inventory flaps.  15s gives 5s of headroom.
+const STALE_MS     = 15_000;   // exclude from merge after 15s of silence
 const LOG_TTL_MS   = 12 * 60 * 60 * 1000;  // 12 hours
 
 // ============================================================
@@ -177,8 +193,8 @@ setInterval(() => {
                     const latestMs = latest.t < 1e12 ? latest.t * 1000 : latest.t;
                     if (latestMs < cutoff) {
                         delete sessions[session];
-                        // Remove expired disk file
-                        try { fs.unlinkSync(path.join(LOGS_DIR, `${room}__${player}__${session}.jsonl`)); } catch {}
+                        // Remove expired disk files (encoded + legacy naming).
+                        deleteLogFile(room, player, session);
                     }
                 }
             }
@@ -245,7 +261,7 @@ function sanitizeInventory(inventory) {
         weapon: cleanName(inv.weapon),
         ability: cleanName(inv.ability),
         melee: cleanName(inv.melee),
-        crystals: clampInt(inv.crystals ?? 0, 0, Number.MAX_SAFE_INTEGER),
+        crystals: Math.max(0, clampInt(inv.crystals ?? 0, 0, Number.MAX_SAFE_INTEGER)),
         health: Math.max(0, toFiniteNumber(inv.health, 0)),
         maxHealth: Math.max(0, toFiniteNumber(inv.maxHealth, 0)),
         weaponMods: sanitizeItemArray(inv.weaponMods),
@@ -260,6 +276,116 @@ function sanitizeInventory(inventory) {
             perks: clampInt(slots.perks ?? 0, 0, 255),
         },
     };
+}
+
+function normalizeIdentifier(value, maxLen = MAX_IDENTIFIER_LEN) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > maxLen) return null;
+    // Disallow path separators and control chars.
+    if (/[\u0000-\u001f\\\/]/.test(trimmed)) return null;
+    return trimmed;
+}
+
+function normalizeSessionId(value) {
+    if (value == null) return null;
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_SESSION_LEN) return null;
+    if (/[\u0000-\u001f\\\/]/.test(trimmed)) return null;
+    return trimmed;
+}
+
+function parseSinceParam(value) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function encodeLogToken(value) {
+    return encodeURIComponent(String(value));
+}
+
+function decodeLogToken(value) {
+    try { return decodeURIComponent(value); } catch { return value; }
+}
+
+function buildLogFileName(room, player, session) {
+    return `${encodeLogToken(room)}__${encodeLogToken(player)}__${encodeLogToken(session)}.jsonl`;
+}
+
+function buildLegacyLogFileName(room, player, session) {
+    return `${room}__${player}__${session}.jsonl`;
+}
+
+function getLogFileCandidates(room, player, session) {
+    return [
+        buildLogFileName(room, player, session),
+        buildLegacyLogFileName(room, player, session),
+    ];
+}
+
+function getPrimaryLogFilePath(room, player, session) {
+    return path.join(LOGS_DIR, buildLogFileName(room, player, session));
+}
+
+function deleteLogFile(room, player, session) {
+    for (const file of getLogFileCandidates(room, player, session)) {
+        try { fs.unlinkSync(path.join(LOGS_DIR, file)); } catch {}
+    }
+}
+
+function sanitizePlayersList(players) {
+    if (!Array.isArray(players)) return null;
+    const out = [];
+    const seen = new Set();
+    for (const raw of players) {
+        const name = normalizeIdentifier(raw, MAX_IDENTIFIER_LEN);
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        out.push(name);
+        if (out.length >= 32) break;
+    }
+    return out;
+}
+
+function sanitizeClientLogEntries(logs, nowMs) {
+    if (!Array.isArray(logs)) return [];
+    const out = [];
+    for (const entry of logs) {
+        if (!entry || typeof entry !== 'object') continue;
+        const tRaw = toFiniteNumber(entry.t, nowMs);
+        const t = Math.floor(tRaw);
+        const catRaw = typeof entry.cat === 'string' ? entry.cat.trim() : '?';
+        const cat = catRaw ? catRaw.slice(0, 32) : '?';
+        const msgRaw = typeof entry.msg === 'string' ? entry.msg : '';
+        const msg = msgRaw.length > MAX_LOG_STRING_LEN ? msgRaw.slice(0, MAX_LOG_STRING_LEN) : msgRaw;
+        let data = entry.data ?? null;
+        if (typeof data === 'string') {
+            if (data.length > MAX_LOG_STRING_LEN) data = data.slice(0, MAX_LOG_STRING_LEN);
+        } else if (data && typeof data === 'object') {
+            try {
+                const serialized = JSON.stringify(data);
+                data = serialized.length > MAX_LOG_STRING_LEN
+                    ? serialized.slice(0, MAX_LOG_STRING_LEN)
+                    : serialized;
+            } catch {
+                data = null;
+            }
+        } else if (typeof data === 'number' || typeof data === 'boolean') {
+            // keep primitive scalars
+        } else {
+            data = null;
+        }
+        out.push({
+            t,
+            cat,
+            msg,
+            data,
+            receivedAt: nowMs,
+        });
+        if (out.length >= MAX_LOG_BATCH_PER_PUSH) break;
+    }
+    return out;
 }
 
 function mergeInventories(room) {
@@ -381,55 +507,50 @@ function mergeInventories(room) {
 
 app.post('/push', (req, res) => {
     const { room, player, inventory, password, players, session, logs } = req.body;
-    if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
-    if (!room || !player) {
-        return res.status(400).json({ error: 'Missing room or player' });
+    if (password !== SHARED_PASSWORD) return res.status(403).json({ error: 'Forbidden' });
+    const roomCode = normalizeIdentifier(room);
+    const playerName = normalizeIdentifier(player);
+    if (!roomCode || !playerName || !inventory || typeof inventory !== 'object' || Array.isArray(inventory)) {
+        return res.status(400).json({ error: 'Missing fields' });
     }
-    if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory)) {
-        return res.status(400).json({ error: 'Invalid or missing inventory (must be a JSON object)' });
-    }
+    const sessionId = normalizeSessionId(session);
 
-    const r = getRoom(room);
+    const r = getRoom(roomCode);
     const now = Date.now();
     const cleanInventory = sanitizeInventory(inventory);
     // Per-field change timestamps for weapon / ability / melee.
     // If the player's new value differs from what they last pushed, bump the timestamp
     // so mergeInventories can pick the most recently changed value per-field across
     // all players, rather than all-or-nothing from the most recent overall pusher.
-    const prev = r[player];
+    const prev = r[playerName];
     const prevInv = prev && prev.inventory;
     const weaponChangedAt  = (prevInv && prevInv.weapon  === cleanInventory.weapon)  ? (prev.weaponChangedAt  || now) : now;
     const abilityChangedAt = (prevInv && prevInv.ability === cleanInventory.ability) ? (prev.abilityChangedAt || now) : now;
     const meleeChangedAt   = (prevInv && prevInv.melee   === cleanInventory.melee)   ? (prev.meleeChangedAt   || now) : now;
-    r[player] = { inventory: cleanInventory, updatedAt: now, lastSeen: now, weaponChangedAt, abilityChangedAt, meleeChangedAt };
+    r[playerName] = { inventory: cleanInventory, updatedAt: now, lastSeen: now, weaponChangedAt, abilityChangedAt, meleeChangedAt };
 
-    if (Array.isArray(players) && players.length > 0) {
-        r.__members = new Set(players);
+    const members = sanitizePlayersList(players);
+    if (members && members.length > 0) {
+        r.__members = new Set(members);
     }
 
     // Store client logs
-    if (Array.isArray(logs) && logs.length > 0 && session) {
-        if (!playerLogs[room]) playerLogs[room] = {};
-        if (!playerLogs[room][player]) playerLogs[room][player] = {};
-        if (!playerLogs[room][player][session]) playerLogs[room][player][session] = [];
-        const arr = playerLogs[room][player][session];
-        const newEntries = logs.map(entry => ({
-            t: entry.t,
-            cat: entry.cat || '?',
-            msg: entry.msg || '',
-            data: entry.data || null,
-            receivedAt: now,
-        }));
+    if (Array.isArray(logs) && logs.length > 0 && sessionId) {
+        if (!playerLogs[roomCode]) playerLogs[roomCode] = {};
+        if (!playerLogs[roomCode][playerName]) playerLogs[roomCode][playerName] = {};
+        if (!playerLogs[roomCode][playerName][sessionId]) playerLogs[roomCode][playerName][sessionId] = [];
+        const arr = playerLogs[roomCode][playerName][sessionId];
+        const newEntries = sanitizeClientLogEntries(logs, now);
         for (const entry of newEntries) arr.push(entry);
         // Persist to disk
-        const logFile = path.join(LOGS_DIR, `${room}__${player}__${session}.jsonl`);
-        const lines = newEntries.map(e => JSON.stringify(e)).join('\n') + '\n';
-        try { fs.appendFileSync(logFile, lines, 'utf8'); } catch {}
+        const logFile = getPrimaryLogFilePath(roomCode, playerName, sessionId);
+        const lines = newEntries.map(e => JSON.stringify(e)).join('\n') + (newEntries.length ? '\n' : '');
+        try { if (lines) fs.appendFileSync(logFile, lines, 'utf8'); } catch {}
     }
 
     const merged = mergeInventories(r);
 
-    srvLog('PUSH', `Push from "${player}" in room "${room}"`, {
+    srvLog('PUSH', `Push from "${playerName}" in room "${roomCode}"`, {
         weapon: cleanInventory.weapon || '(none)',
         ability: cleanInventory.ability || '(none)',
         melee: cleanInventory.melee || '(none)',
@@ -441,33 +562,47 @@ app.post('/push', (req, res) => {
         perks: (cleanInventory.perks || []).length,
         relics: (cleanInventory.relics || []).length,
         clientLogs: (logs || []).length,
-        session: session || '(none)',
+        session: sessionId || '(none)',
     });
 
     res.json({ inventory: merged });
 });
 
 app.get('/sync/:room', (req, res) => {
-    const r = rooms[req.params.room];
+    const roomCode = normalizeIdentifier(req.params.room);
+    if (!roomCode) return res.status(400).json({ error: 'Invalid room' });
+    const r = rooms[roomCode];
     if (!r) return res.json({ inventory: null });
     res.json({ inventory: mergeInventories(r) });
 });
 
 app.post('/heartbeat', (req, res) => {
     const { room, player, password } = req.body || {};
-    if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
-    if (!room || !player) return res.status(400).json({ error: 'Missing fields' });
-    const r = rooms[room];
-    if (r && r[player]) r[player].lastSeen = Date.now();
+    if (password !== SHARED_PASSWORD) return res.status(403).json({ error: 'Forbidden' });
+    const roomCode = normalizeIdentifier(room);
+    const playerName = normalizeIdentifier(player);
+    if (!roomCode || !playerName) return res.status(400).json({ error: 'Missing fields' });
+    const r = rooms[roomCode];
+    if (r && r[playerName]) {
+        const entry = r[playerName];
+        entry.lastSeen = Date.now();
+        if (entry.ghost) {
+            entry.ghost = false;
+            delete entry.leftAt;
+            srvLog('ROOM', `Heartbeat revived ghost "${playerName}"`, { room: roomCode });
+        }
+    }
     res.json({ ok: true });
 });
 
 app.post('/leave', (req, res) => {
     const { room, player, password } = req.body || {};
-    if (password !== '4982904') return res.status(403).json({ error: 'Forbidden' });
-    if (!room || !player) return res.status(400).json({ error: 'Missing fields' });
-    const r = rooms[room];
-    if (r && r[player]) {
+    if (password !== SHARED_PASSWORD) return res.status(403).json({ error: 'Forbidden' });
+    const roomCode = normalizeIdentifier(room);
+    const playerName = normalizeIdentifier(player);
+    if (!roomCode || !playerName) return res.status(400).json({ error: 'Missing fields' });
+    const r = rooms[roomCode];
+    if (r && r[playerName]) {
         // Ghost the player rather than deleting them immediately.  This preserves their
         // crystals, slots, and item contributions in the pool so the remaining players
         // don't instantly lose those values.  Health is zeroed — the player died/left,
@@ -476,20 +611,20 @@ app.post('/leave', (req, res) => {
         // don't get a vote on which weapon the survivors equip).
         // The ghost is cleaned up by the normal stale-player sweep once the room
         // becomes idle, or immediately if the room has no other live players.
-        const entry = r[player];
+        const entry = r[playerName];
         if (entry.inventory) {
             entry.inventory.health    = 0;
             entry.inventory.maxHealth = 0;
         }
         entry.ghost    = true;
         entry.leftAt   = Date.now();
-        srvLog('LEAVE', `"${player}" ghosted in room "${room}" — pool contribution frozen`);
+        srvLog('LEAVE', `"${playerName}" ghosted in room "${roomCode}" — pool contribution frozen`);
 
         // If no live players remain, remove the room entirely.
         const liveCount = Object.entries(r).filter(([k, v]) => k !== '__members' && !v.ghost).length;
         if (liveCount === 0) {
-            delete rooms[room];
-            srvLog('LEAVE', `Room "${room}" removed — no live players`);
+            delete rooms[roomCode];
+            srvLog('LEAVE', `Room "${roomCode}" removed — no live players`);
         }
     }
     res.json({ ok: true });
@@ -498,7 +633,7 @@ app.post('/leave', (req, res) => {
 app.get('/health', (req, res) => {
     const summary = Object.entries(rooms).map(([code, room]) => ({
         room:    code,
-        players: Object.keys(room).filter(k => k !== '__members').length,
+        players: Object.entries(room).filter(([k, v]) => k !== '__members' && !v.ghost).length,
     }));
     res.json({ ok: true, rooms: summary });
 });
@@ -510,7 +645,7 @@ app.get('/health', (req, res) => {
 // Server-side logs — must be defined BEFORE /logs/:room to prevent Express
 // matching "server" as a room name.
 app.get('/logs/server', (req, res) => {
-    const since = parseInt(req.query.since) || 0;
+    const since = parseSinceParam(req.query.since);
     const filtered = since ? serverLogs.filter(e => e.t > since) : serverLogs;
     res.json(filtered);
 });
@@ -533,8 +668,9 @@ app.get('/logs', (req, res) => {
 
 // All logs for a room, organised by player → session
 app.get('/logs/:room', (req, res) => {
-    const room = req.params.room;
-    const since = parseInt(req.query.since) || 0;
+    const room = normalizeIdentifier(req.params.room);
+    if (!room) return res.status(400).json({ error: 'Invalid room' });
+    const since = parseSinceParam(req.query.since);
     const data = playerLogs[room];
     if (!data) return res.json({});
     const result = {};
@@ -551,11 +687,16 @@ app.get('/logs/:room', (req, res) => {
 
 // Logs for a specific player in a room
 app.get('/logs/:room/:player', (req, res) => {
-    const { room, player } = req.params;
-    const sessionFilter = req.query.session;
-    const since = parseInt(req.query.since) || 0;
+    const room = normalizeIdentifier(req.params.room);
+    const player = normalizeIdentifier(req.params.player);
+    if (!room || !player) return res.status(400).json({ error: 'Invalid room or player' });
+    const sessionFilter = req.query.session ? normalizeSessionId(req.query.session) : null;
+    const since = parseSinceParam(req.query.since);
     const data = playerLogs[room]?.[player];
     if (!data) return res.json({});
+    if (req.query.session && !sessionFilter) {
+        return res.status(400).json({ error: 'Invalid session' });
+    }
     if (sessionFilter) {
         const entries = data[sessionFilter] || [];
         const filtered = since ? entries.filter(e => (e.receivedAt || 0) > since) : entries;
@@ -579,7 +720,12 @@ app.get('/rooms', (req, res) => {
         const players = {};
         for (const [name, data] of Object.entries(room)) {
             if (name === '__members') continue;
-            players[name] = { inventory: data.inventory, updatedAt: data.updatedAt, lastSeen: data.lastSeen || data.updatedAt };
+            players[name] = {
+                inventory: data.inventory,
+                updatedAt: data.updatedAt,
+                lastSeen: data.lastSeen || data.updatedAt,
+                ghost: !!data.ghost,
+            };
         }
         out[code] = {
             players,
@@ -587,7 +733,10 @@ app.get('/rooms', (req, res) => {
             members: room.__members ? [...room.__members] : null,
         };
     }
-    const totalPlayers = Object.values(out).reduce((s, r) => s + Object.keys(r.players).length, 0);
+    const totalPlayers = Object.values(out).reduce(
+        (sum, r) => sum + Object.values(r.players).filter(p => !p.ghost).length,
+        0
+    );
     // Include log session info for the dashboard
     const logInfo = {};
     for (const [room, players] of Object.entries(playerLogs)) {
@@ -922,7 +1071,8 @@ function renderLogPanel(room, logInfo){
 }
 
 function renderRoom(code,roomData,logInfo){
-  var playerEntries=Object.entries(roomData.players||{});
+  var allPlayerEntries=Object.entries(roomData.players||{});
+  var playerEntries=allPlayerEntries.filter(function(e){return !e[1].ghost;});
   var members=roomData.members;
   var connectedSet={};
   playerEntries.forEach(function(e){connectedSet[e[0]]=true;});
@@ -948,8 +1098,8 @@ function renderRoom(code,roomData,logInfo){
     '<div class="merged-box">'+renderInv(roomData.merged)+'</div></div>';
 
   var playersSection='';
-  if(playerEntries.length){
-    var cards=playerEntries.map(function(e){return renderPlayerCard(e[0],e[1]);}).join('');
+  if(allPlayerEntries.length){
+    var cards=allPlayerEntries.map(function(e){return renderPlayerCard(e[0],e[1]);}).join('');
     playersSection=
       '<div><div class="sec sec-players">&#x1F464; Player Contributions</div>' +
       '<div class="players-grid">'+cards+'</div></div>';
