@@ -593,6 +593,11 @@ function mergeInventories(room) {
         }
     }
 
+    if (livePlayers.length === 1 && livePlayers[0].clientInstanceId) {
+        merged.clientInstanceId = livePlayers[0].clientInstanceId;
+        merged.pushSeq = clampInt(livePlayers[0].pushSeq ?? 0, 0, UINT32_MAX);
+    }
+
     return merged;
 }
 
@@ -601,7 +606,7 @@ function mergeInventories(room) {
 // ============================================================
 
 app.post('/push', (req, res) => {
-    const { room, player, inventory, password, players, session, logs } = req.body;
+    const { room, player, inventory, password, players, session, logs, clientInstanceId, pushSeq } = req.body;
     if (password !== SHARED_PASSWORD) return res.status(403).json({ error: 'Forbidden' });
     const roomCode = normalizeIdentifier(room);
     const playerName = normalizeIdentifier(player);
@@ -615,6 +620,9 @@ app.post('/push', (req, res) => {
     const prev = r[playerName];
     const prevInv = prev && prev.inventory;
     const cleanInventory = sanitizeInventory(inventory, prevInv);
+    const cleanClientInstanceId = normalizeSessionId(clientInstanceId)
+        || normalizeSessionId(inventory.clientInstanceId);
+    const cleanPushSeq = clampInt(pushSeq ?? inventory.pushSeq ?? 0, 0, UINT32_MAX);
     // Per-field change timestamps for weapon / ability / melee.
     // If the player's new value differs from what they last pushed, bump the timestamp
     // so mergeInventories can pick the most recently changed value per-field across
@@ -622,7 +630,16 @@ app.post('/push', (req, res) => {
     const weaponChangedAt  = (prevInv && prevInv.weapon  === cleanInventory.weapon)  ? (prev.weaponChangedAt  || now) : now;
     const abilityChangedAt = (prevInv && prevInv.ability === cleanInventory.ability) ? (prev.abilityChangedAt || now) : now;
     const meleeChangedAt   = (prevInv && prevInv.melee   === cleanInventory.melee)   ? (prev.meleeChangedAt   || now) : now;
-    r[playerName] = { inventory: cleanInventory, updatedAt: now, lastSeen: now, weaponChangedAt, abilityChangedAt, meleeChangedAt };
+    r[playerName] = {
+        inventory: cleanInventory,
+        updatedAt: now,
+        lastSeen: now,
+        weaponChangedAt,
+        abilityChangedAt,
+        meleeChangedAt,
+        clientInstanceId: cleanClientInstanceId,
+        pushSeq: cleanPushSeq,
+    };
 
     const members = sanitizePlayersList(players);
     if (members && members.length > 0) {
@@ -660,6 +677,8 @@ app.post('/push', (req, res) => {
         relics: (cleanInventory.relics || []).length,
         clientLogs: (logs || []).length,
         session: sessionId || '(none)',
+        clientInstanceId: cleanClientInstanceId || '(none)',
+        pushSeq: cleanPushSeq,
     });
 
     res.json({ inventory: merged });

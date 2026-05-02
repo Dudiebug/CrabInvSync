@@ -158,8 +158,10 @@ while ($true) {
                 inventory = $inv
             }
             # Forward session ID and client logs if present in push.json
-            if ($pushData.PSObject.Properties['session']) { $bodyObj['session'] = $pushData.session }
-            if ($pushData.PSObject.Properties['logs'])    { $bodyObj['logs']    = $pushData.logs }
+            if ($pushData.PSObject.Properties['session'])          { $bodyObj['session']          = $pushData.session }
+            if ($pushData.PSObject.Properties['logs'])             { $bodyObj['logs']             = $pushData.logs }
+            if ($pushData.PSObject.Properties['clientInstanceId']) { $bodyObj['clientInstanceId'] = $pushData.clientInstanceId }
+            if ($pushData.PSObject.Properties['pushSeq'])          { $bodyObj['pushSeq']          = $pushData.pushSeq }
             $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 8
 
             LogFile "PUSH  room=$currentRoom  player=$PlayerName  body=$bodyJson"

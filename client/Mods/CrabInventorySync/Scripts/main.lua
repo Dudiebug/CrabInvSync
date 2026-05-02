@@ -106,6 +106,7 @@ local function makeInstanceId()
     return string.format("%d_%s", os.time(), addr)
 end
 local INSTANCE_ID = makeInstanceId()
+local CLIENT_INSTANCE_ID = INSTANCE_ID
 local PUSH_FILE = SCRIPT_DIR_PRIMARY .. "push_" .. INSTANCE_ID .. ".json"
 local RECV_FILE = SCRIPT_DIR_PRIMARY .. "recv_" .. INSTANCE_ID .. ".json"
 
@@ -398,6 +399,12 @@ local function encodeInventory(inv)
         clampInt(sl.meleeMods, 0, BYTE_MAX),
         clampInt(sl.perks, 0, BYTE_MAX)
     ))
+    if inv.clientInstanceId and inv.clientInstanceId ~= "" then
+        table.insert(parts, '"clientInstanceId":' .. jsonStr(inv.clientInstanceId))
+    end
+    if inv.pushSeq then
+        table.insert(parts, '"pushSeq":' .. tostring(clampInt(inv.pushSeq, 0, UINT32_MAX)))
+    end
     return "{" .. table.concat(parts, ",") .. "}"
 end
 
@@ -441,6 +448,8 @@ local function decodeInventory(json)
         meleeMods   = clampInt(slotsBlock and slotsBlock:match('"meleeMods"%s*:%s*(%d+)'), 0, BYTE_MAX),
         perks       = clampInt(slotsBlock and slotsBlock:match('"perks"%s*:%s*(%d+)'), 0, BYTE_MAX),
     }
+    inv.clientInstanceId = json:match('"clientInstanceId"%s*:%s*"([^"]*)"') or ""
+    inv.pushSeq = clampInt(json:match('"pushSeq"%s*:%s*(%d+)'), 0, UINT32_MAX)
     return inv
 end
 
@@ -495,9 +504,11 @@ end
 -- payload includes per-item Level, AccumulatedBuff, and Enhancements data.
 local function readItemArray(ps, propName, daField)
     local items = {}
-    pcall(function()
+    local readable = false
+    local okRead = pcall(function()
         local arr = ps:GetPropertyValue(propName)
         if not arr then return end
+        readable = true
         arr:ForEach(function(_, elem)
             if not elem:get():IsValid() then return end
             local okda, da = pcall(function() return elem:get()[daField] end)
@@ -518,7 +529,7 @@ local function readItemArray(ps, propName, daField)
     end)
     -- Sort by name so the encoded JSON is deterministic regardless of TArray order.
     table.sort(items, function(a, b) return a.name < b.name end)
-    return items
+    return items, (readable and okRead)
 end
 
 -- Returns an empty array — the server merges all active players in the room.
@@ -919,6 +930,7 @@ local ownMaxHealth, lastGameMaxHealth
 local hasConfirmedValidHealthSample = false
 local ownSlots      = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
 local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil }
+local lastSentPushSeq = 0
 
 -- Transient-empty-read debounce for readItemArray.  TArrays occasionally read as
 -- empty for a single tick while the engine is mid-update (e.g. swapping a mod);
@@ -929,6 +941,161 @@ local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=ni
 local EMPTY_READ_CONFIRM_TICKS = 2
 local lastNonEmptyItems = {}   -- cat.inv -> previous items[] (only when non-empty)
 local emptyReadStreak   = {}   -- cat.inv -> consecutive empty-read count
+
+-- Startup item-array readiness gate.  The first few PlayerState reads can expose
+-- valid equipment DAs while mod/perk/relic TArrays are still empty or only partly
+-- populated.  We require several consecutive whole-inventory item reads before any
+-- item arrays are allowed into PUSH_FILE, and keep the last stable local item state
+-- when startup/readiness reads briefly go less complete.
+local ITEM_ARRAY_STABLE_TICKS = 3
+local ITEM_ARRAY_CATEGORIES = {
+    { key="weaponMods",  prop="WeaponMods",  da="WeaponModDA",  flag=function() return SYNC_WEAPON_MODS end },
+    { key="abilityMods", prop="AbilityMods", da="AbilityModDA", flag=function() return SYNC_ABILITY_MODS end },
+    { key="meleeMods",   prop="MeleeMods",   da="MeleeModDA",   flag=function() return SYNC_MELEE_MODS end },
+    { key="perks",       prop="Perks",       da="PerkDA",       flag=function() return SYNC_PERKS end },
+    { key="relics",      prop="Relics",      da="RelicDA",      flag=function() return SYNC_RELICS end },
+}
+local itemReadinessCandidateSig = nil
+local itemReadinessCandidateTicks = 0
+local itemReadinessReady = false
+local itemReadinessStableState = nil
+
+local function cloneItem(item)
+    local src = normalizeItem(item)
+    local enhancements = {}
+    for _, value in ipairs(src.enhancements or {}) do table.insert(enhancements, value) end
+    return { name=src.name, level=src.level, accum=src.accum, enhancements=enhancements }
+end
+
+local function cloneItemArraysFrom(inv)
+    local out = {}
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        out[cat.key] = {}
+        for _, item in ipairs((inv and inv[cat.key]) or {}) do
+            table.insert(out[cat.key], cloneItem(item))
+        end
+    end
+    return out
+end
+
+local function copyItemArraysInto(inv, source)
+    if not inv or not source then return end
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        inv[cat.key] = {}
+        for _, item in ipairs(source[cat.key] or {}) do
+            table.insert(inv[cat.key], cloneItem(item))
+        end
+    end
+end
+
+local function itemArraySummary(inv)
+    local parts = {}
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        table.insert(parts, cat.key .. "=" .. tostring(#((inv and inv[cat.key]) or {})))
+    end
+    return table.concat(parts, " ")
+end
+
+local function itemReadinessSignature(inv)
+    local parts = {}
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        table.insert(parts, cat.key .. ":" .. table.concat(sortedItemSignatures((inv and inv[cat.key]) or {}), ";"))
+    end
+    return table.concat(parts, "|")
+end
+
+local function itemStateLessComplete(candidate, stable)
+    if not candidate or not stable then return false end
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        if #((candidate[cat.key]) or {}) < #((stable[cat.key]) or {}) then
+            return true, cat.key
+        end
+    end
+    return false, nil
+end
+
+local function hasStableItemCategory(key)
+    return itemReadinessStableState ~= nil and itemReadinessStableState[key] ~= nil
+end
+
+local function itemCountsByName(items)
+    local counts = {}
+    for _, item in ipairs(items or {}) do
+        local name = normalizeItem(item).name
+        if name ~= "" then counts[name] = (counts[name] or 0) + 1 end
+    end
+    return counts
+end
+
+local function itemCountsEqualByName(left, right)
+    local leftCounts = itemCountsByName(left)
+    local rightCounts = itemCountsByName(right)
+    for name, count in pairs(leftCounts) do
+        if (rightCounts[name] or 0) ~= count then return false end
+    end
+    for name, count in pairs(rightCounts) do
+        if (leftCounts[name] or 0) ~= count then return false end
+    end
+    return true
+end
+
+local function resetItemReadiness()
+    itemReadinessCandidateSig = nil
+    itemReadinessCandidateTicks = 0
+    itemReadinessReady = false
+end
+
+local function updateItemReadiness(inv, readable)
+    local allReadable = true
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        if cat.flag() and readable[cat.key] ~= true then
+            allReadable = false
+            break
+        end
+    end
+
+    local lessComplete, lessKey = itemStateLessComplete(inv, itemReadinessStableState)
+    if lessComplete then
+        copyItemArraysInto(inv, itemReadinessStableState)
+        inv._itemReadinessReusedStable = true
+        print(string.format(
+            "[CrabSync:read] item push skipped transient startup read - %s less complete; reusing stable %s\n",
+            lessKey or "items", itemArraySummary(inv)))
+    end
+
+    if not allReadable then
+        inv._itemsReady = false
+        print(string.format(
+            "[CrabSync:read] item push skipped transient startup read - arrays not readable (%s)\n",
+            itemArraySummary(inv)))
+        return
+    end
+
+    local sig = itemReadinessSignature(inv)
+    if sig ~= itemReadinessCandidateSig then
+        itemReadinessCandidateSig = sig
+        itemReadinessCandidateTicks = 1
+        print(string.format(
+            "[CrabSync:read] item readiness candidate: %s ticks=1/%d\n",
+            itemArraySummary(inv), ITEM_ARRAY_STABLE_TICKS))
+    else
+        itemReadinessCandidateTicks = itemReadinessCandidateTicks + 1
+        if not itemReadinessReady then
+            print(string.format(
+                "[CrabSync:read] item readiness candidate: %s ticks=%d/%d\n",
+                itemArraySummary(inv), itemReadinessCandidateTicks, ITEM_ARRAY_STABLE_TICKS))
+        end
+    end
+
+    if itemReadinessCandidateTicks >= ITEM_ARRAY_STABLE_TICKS then
+        itemReadinessStableState = cloneItemArraysFrom(inv)
+        if not itemReadinessReady then
+            print(string.format("[CrabSync:read] item readiness stable: %s\n", itemArraySummary(inv)))
+        end
+        itemReadinessReady = true
+    end
+    inv._itemsReady = itemReadinessReady
+end
 
 -- ============================================================
 -- INVENTORY READ
@@ -1107,16 +1274,12 @@ local function readInventory(ps)
     -- AccumulatedBuff are captured in the push payload.  Results are sorted by name
     -- so the JSON is deterministic regardless of UE4 TArray internal ordering —
     -- this eliminates the false-positive change detection that caused the shuffle bug.
-    for _, cat in ipairs({
-        { flag=SYNC_WEAPON_MODS,  inv="weaponMods",  prop="WeaponMods",  da="WeaponModDA"  },
-        { flag=SYNC_ABILITY_MODS, inv="abilityMods", prop="AbilityMods", da="AbilityModDA" },
-        { flag=SYNC_MELEE_MODS,   inv="meleeMods",   prop="MeleeMods",   da="MeleeModDA"   },
-        { flag=SYNC_PERKS,        inv="perks",       prop="Perks",       da="PerkDA"       },
-        { flag=SYNC_RELICS,       inv="relics",      prop="Relics",      da="RelicDA"      },
-    }) do
-        if cat.flag then
-            local items = readItemArray(ps, cat.prop, cat.da)
-            local key = cat.inv
+    local itemReadable = {}
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        if cat.flag() then
+            local items, readable = readItemArray(ps, cat.prop, cat.da)
+            local key = cat.key
+            itemReadable[key] = readable
             if #items == 0
                and lastNonEmptyItems[key]
                and (emptyReadStreak[key] or 0) < EMPTY_READ_CONFIRM_TICKS
@@ -1135,10 +1298,12 @@ local function readInventory(ps)
                 inv[key] = items
             end
         else
-            inv[cat.inv] = {}
+            inv[cat.key] = {}
+            itemReadable[cat.key] = true
         end
     end
 
+    updateItemReadiness(inv, itemReadable)
 
     if SYNC_SLOTS then
         -- Delta-tracking for slot counts, identical to the crystals / health pattern.
@@ -1479,6 +1644,33 @@ local function applyInventory(ps, inv)
             local recvItems = {}
             for _, item in ipairs(entry.src) do table.insert(recvItems, normalizeItem(item)) end
             local gameItems = getItemsFromPS(ps, entry.prop, entry.da)
+            local recvIsSelfEcho = (inv.clientInstanceId ~= nil and inv.clientInstanceId ~= "" and inv.clientInstanceId == CLIENT_INSTANCE_ID)
+            local recvPushSeq = clampInt(inv.pushSeq, 0, UINT32_MAX)
+            local oldSelfEcho = recvIsSelfEcho and recvPushSeq > 0 and recvPushSeq < lastSentPushSeq
+            local lessCompleteRecv = (#recvItems < #gameItems) and (hasStableItemCategory(entry.key) or itemReadinessReady ~= true)
+            local structuralApplyBlocked = false
+
+            if oldSelfEcho then
+                structuralApplyBlocked = true
+                applyReport.partialSkipped = true
+                print(string.format(
+                    "[CrabSync:apply] structural apply skipped: self echo - %s recvSeq=%d localSeq=%d\n",
+                    entry.prop, recvPushSeq, lastSentPushSeq))
+            end
+            if lessCompleteRecv then
+                structuralApplyBlocked = true
+                applyReport.partialSkipped = true
+                print(string.format(
+                    "[CrabSync:apply] structural apply skipped: less-complete recv - startup/self-echo less-complete recv skipped. %s game=%d recv=%d stable=%s\n",
+                    entry.prop, #gameItems, #recvItems, tostring(hasStableItemCategory(entry.key))))
+            elseif recvIsSelfEcho and #recvItems < #gameItems then
+                structuralApplyBlocked = true
+                applyReport.partialSkipped = true
+                print(string.format(
+                    "[CrabSync:apply] structural apply skipped: self echo - %s less complete game=%d recv=%d\n",
+                    entry.prop, #gameItems, #recvItems))
+            end
+
             local diff = compareItemMetadata(gameItems, recvItems)
 
             if diff.kind == "reorder-only no-op" then
@@ -1526,7 +1718,17 @@ local function applyInventory(ps, inv)
 
                 local filledSlots, totalSlots = getArrayOccupancy(ps, entry.prop, entry.da)
                 local hasVacancy = totalSlots > filledSlots
-                if missingInRecv or (newInRecv and hasVacancy) then
+                if structuralApplyBlocked then
+                    if itemCountsEqualByName(gameItems, recvItems) then
+                        if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                            applyReport.applied = true
+                        end
+                    end
+                elseif missingInRecv or (newInRecv and hasVacancy) then
+                    local reason = missingInRecv and "recv has different item names at same count" or "recv adds items and local slot vacancy exists"
+                    print(string.format(
+                        "[CrabSync:apply] structural apply allowed: reason=%s (%s)\n",
+                        reason, entry.prop))
                     print(string.format(
                         "[CrabSync:apply] %s name mismatch (%d game / %d recv, slots %d/%d) - writing slots\n",
                         entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
@@ -1721,6 +1923,10 @@ local function pushIfChanged()
     if not ps then return end
 
     local inv = readInventory(ps)
+    if inv._itemsReady ~= true then
+        print("[CrabSync:read] item push skipped transient startup read - waiting for stable item arrays\n")
+        return
+    end
     local invJson = encodeInventory(inv)
     local nowSec = os.time()
     local forcePush = false
@@ -1734,7 +1940,16 @@ local function pushIfChanged()
     -- Wrap inventory with room, session player list, and password.
     local sessionPlayers = getSessionPlayers()
     local playersJson    = jsonStrArray(sessionPlayers)
-    local payload = '{"room":' .. jsonStr(ROOM_CODE) .. ',"players":' .. playersJson .. ',"password":' .. jsonStr(ROOM_PASSWORD) .. ',"inventory":' .. invJson .. '}'
+    lastSentPushSeq = clampInt(lastSentPushSeq + 1, 0, UINT32_MAX)
+    inv.clientInstanceId = CLIENT_INSTANCE_ID
+    inv.pushSeq = lastSentPushSeq
+    local payloadInvJson = encodeInventory(inv)
+    local payload = '{"room":' .. jsonStr(ROOM_CODE)
+        .. ',"players":' .. playersJson
+        .. ',"password":' .. jsonStr(ROOM_PASSWORD)
+        .. ',"clientInstanceId":' .. jsonStr(CLIENT_INSTANCE_ID)
+        .. ',"pushSeq":' .. tostring(lastSentPushSeq)
+        .. ',"inventory":' .. payloadInvJson .. '}'
     local f = io.open(PUSH_FILE, "w")
     if f then
         f:write(payload)
@@ -1834,6 +2049,7 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         pendingWeapon  = nil;  pendingWCount = 0;  stableWeapon  = nil
         pendingAbility = nil;  pendingACount = 0;  stableAbility = nil
         pendingMelee   = nil;  pendingMCount = 0;  stableMelee   = nil
+        resetItemReadiness()
         print("[CrabInventorySync] Resuming continuous sync.\n")
     end)
 end)
@@ -1850,6 +2066,7 @@ RegisterKeyBind(Key.F9, function()
     pendingWeapon  = nil;  pendingWCount = 0;  stableWeapon  = nil
     pendingAbility = nil;  pendingACount = 0;  stableAbility = nil
     pendingMelee   = nil;  pendingMCount = 0;  stableMelee   = nil
+    resetItemReadiness()
     print("[CrabInventorySync] Manual sync forced (F9).\n")
 end)
 
