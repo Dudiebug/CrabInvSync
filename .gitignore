@@ -1,15 +1,5 @@
-# UE4SS runtime binaries and configs (not our source)
-client/UE4SS.dll
-client/dwmapi.dll
-client/imgui.ini
-client/UE4SS-settings.ini
-
-# UE4SS built-in mods and shared libs (not our source)
-client/Mods/shared/
-client/Mods/BPML_GenericFunctions/
-client/Mods/BPModLoaderMod/
-client/Mods/Keybinds/
-client/Mods/mods.txt
+# The full client distribution is tracked, including UE4SS runtime files,
+# built-in mods, shared libraries, and mods.txt.
 
 # Runtime-generated IPC files
 push*.json
