@@ -2,7 +2,7 @@
 
 Real-time shared inventory sync for **Crab Champions** co-op — a three-tier Lua / PowerShell / Node.js architecture.
 
-> **⚠️ Beta — known crash:** Joining another player's game while this mod is installed will crash your client. Host-only sessions work. See [Known Issues](#known-issues).
+> **Beta safety note:** Joined clients run read-only/no-apply by default behind a lifecycle gate. Host/solo testing remains the primary supported path while multiplayer contribution safety is still being built.
 
 ## How it works
 
@@ -67,6 +67,10 @@ Edit `Mods/CrabInventorySync/Scripts/config.txt`:
 | `syncRelics` | `true` | Sync relic list |
 | `syncSlots` | `true` | Sync mod/perk slot counts (SetPropertyValue only — no UFunctions) |
 | `allowScalarMetadataApply` | `false` | Safety gate for item `InventoryInfo` scalar writes; keep disabled |
+| `allowJoinedClientApply` | `false` | Joined clients are read-only/no-apply by default |
+| `allowMultiplayerApply` | `false` | Multiplayer live-state applies are disabled by default |
+| `hostOnlyApply` | `true` | If multiplayer apply is enabled later, only host/solo roles may apply by default |
+| `lifecycleStableTicksRequired` | `5` | Consecutive stable shallow lifecycle probes required before sync reads/pushes/applies |
 | `crystalsProperty` | `Crystals` | Internal PlayerState property name for crystals |
 
 Runtime IPC files are per game launch: `push_<instance>.json` and
@@ -86,6 +90,14 @@ are detected and logged. Scalar metadata apply is quarantined by default with
 `allowScalarMetadataApply=false`, so the client does not write `Level`,
 `AccumulatedBuff`, or nested `Enhancements` back into live item structs until
 stable slot identity and duplicate-free pairing are proven.
+
+The client has a global lifecycle safety gate. On startup, join, travel, and
+manual reset it enters `suspended`, then `probing`, and only acts after several
+consecutive stable shallow probes. While unstable it does not read full
+inventory, push, apply recv, traverse item arrays deeply, or write equipment,
+crystals, slots, health, or item metadata. Joined clients are read-only/no-apply
+by default with `allowJoinedClientApply=false`; unknown roles are treated as
+unsafe. The contribution ledger for safe multiplayer apply is still pending.
 
 ## Server dashboard
 
@@ -134,13 +146,19 @@ bash deploy-flat.sh
 
 ## Known issues
 
-### ⚠️ Joining another player's session crashes the game
+### Joined-client apply is disabled by default
 
-**Joining** a session hosted by another player while this mod is installed will crash your client. **Hosting** a session works correctly.
+Joined clients are kept in read-only/no-apply safe mode by default. They may read
+and push only after the lifecycle probe is stable, but they do not apply recv to
+live game state unless `allowJoinedClientApply=true` is explicitly set for
+testing.
 
-This is a known UE4SS limitation: when a client joins, the game's replication system initialises PlayerState objects in a specific order, and certain UE4SS hooks fire against partially-constructed objects before they are safe to access. The mod's main poll loop and all banned UFunction calls have been removed, but the crash on join is not yet resolved.
+This protects the known risky join/travel window where Unreal replication can
+expose partially constructed or stale objects. The contribution ledger and
+fully safe joined-client apply path are still pending.
 
-**Workaround:** only use this mod in sessions where you are the host.
+**Workaround for live shared applies:** only use live-state applying sync in solo
+or host-controlled test sessions for now.
 
 ### Other limitations
 

@@ -340,6 +340,9 @@ function sanitizeInventory(inventory, prevInv = null) {
             meleeMods: clampInt(slots.meleeMods ?? 0, 0, BYTE_MAX),
             perks: clampInt(slots.perks ?? 0, 0, BYTE_MAX),
         },
+        lifecycleGeneration: clampInt(inv.lifecycleGeneration ?? 0, 0, UINT32_MAX),
+        clientRole: cleanName(inv.clientRole),
+        readOnlySafeMode: !!inv.readOnlySafeMode,
     };
     if (healthFields.healthValid) {
         out.health = healthFields.health;
@@ -596,6 +599,9 @@ function mergeInventories(room) {
     if (livePlayers.length === 1 && livePlayers[0].clientInstanceId) {
         merged.clientInstanceId = livePlayers[0].clientInstanceId;
         merged.pushSeq = clampInt(livePlayers[0].pushSeq ?? 0, 0, UINT32_MAX);
+        merged.lifecycleGeneration = clampInt(livePlayers[0].inventory.lifecycleGeneration ?? 0, 0, UINT32_MAX);
+        merged.clientRole = livePlayers[0].inventory.clientRole || '';
+        merged.readOnlySafeMode = !!livePlayers[0].inventory.readOnlySafeMode;
     }
 
     return merged;

@@ -41,6 +41,10 @@ local SYNC_RELICS        = true
 local SYNC_HEALTH        = false
 local SYNC_SLOTS         = true
 local ALLOW_SCALAR_METADATA_APPLY = false
+local ALLOW_JOINED_CLIENT_APPLY = false
+local ALLOW_MULTIPLAYER_APPLY = false
+local HOST_ONLY_APPLY = true
+local LIFECYCLE_STABLE_TICKS_REQUIRED = 5
 -- Internal property name for crystals on CrabPS (adjust if values read as 0)
 local CRYSTALS_PROPERTY  = "Crystals"
 -- Shared secret sent with every push to keep the server endpoint private.
@@ -161,6 +165,15 @@ local function loadConfig()
         syncHealth       = function(v) SYNC_HEALTH       = (v == "true") end,
         syncSlots        = function(v) SYNC_SLOTS        = (v == "true") end,
         allowScalarMetadataApply = function(v) ALLOW_SCALAR_METADATA_APPLY = (v == "true") end,
+        allowJoinedClientApply = function(v) ALLOW_JOINED_CLIENT_APPLY = (v == "true") end,
+        allowMultiplayerApply = function(v) ALLOW_MULTIPLAYER_APPLY = (v == "true") end,
+        hostOnlyApply = function(v) HOST_ONLY_APPLY = (v ~= "false") end,
+        lifecycleStableTicksRequired = function(v)
+            local n = math.floor(tonumber(v) or LIFECYCLE_STABLE_TICKS_REQUIRED)
+            if n < 1 then n = 1 end
+            if n > 60 then n = 60 end
+            LIFECYCLE_STABLE_TICKS_REQUIRED = n
+        end,
     }
 
     local lineNo = 0
@@ -444,6 +457,15 @@ local function encodeInventory(inv)
     if inv.pushSeq then
         table.insert(parts, '"pushSeq":' .. tostring(clampInt(inv.pushSeq, 0, UINT32_MAX)))
     end
+    if inv.lifecycleGeneration then
+        table.insert(parts, '"lifecycleGeneration":' .. tostring(clampInt(inv.lifecycleGeneration, 0, UINT32_MAX)))
+    end
+    if inv.clientRole and inv.clientRole ~= "" then
+        table.insert(parts, '"clientRole":' .. jsonStr(inv.clientRole))
+    end
+    if inv.readOnlySafeMode ~= nil then
+        table.insert(parts, '"readOnlySafeMode":' .. tostring(inv.readOnlySafeMode == true))
+    end
     return "{" .. table.concat(parts, ",") .. "}"
 end
 
@@ -489,6 +511,10 @@ local function decodeInventory(json)
     }
     inv.clientInstanceId = json:match('"clientInstanceId"%s*:%s*"([^"]*)"') or ""
     inv.pushSeq = clampInt(json:match('"pushSeq"%s*:%s*(%d+)'), 0, UINT32_MAX)
+    local lifecycleRaw = json:match('"lifecycleGeneration"%s*:%s*(%d+)')
+    inv.lifecycleGeneration = lifecycleRaw and clampInt(lifecycleRaw, 0, UINT32_MAX) or nil
+    inv.clientRole = json:match('"clientRole"%s*:%s*"([^"]*)"') or ""
+    inv.readOnlySafeMode = (json:match('"readOnlySafeMode"%s*:%s*(%a+)') == "true")
     return inv
 end
 
@@ -526,19 +552,59 @@ end
 
 -- Read all mod/perk/relic slots on ps and return a name→count table.
 -- Called by readInventory (delta computation) and applyInventory (anchoring).
+local function isValidObject(obj)
+    if not obj then return false end
+    local ok, valid = pcall(function() return obj:IsValid() end)
+    return ok and valid == true
+end
+
+local function safeGetProperty(obj, propName)
+    if not isValidObject(obj) then return false, nil end
+    local ok, value = pcall(function() return obj:GetPropertyValue(propName) end)
+    if ok then return true, value end
+    return false, nil
+end
+
+local function safeGetDirectField(obj, fieldName)
+    if not isValidObject(obj) then return false, nil end
+    local ok, value = pcall(function() return obj[fieldName] end)
+    if ok then return true, value end
+    return false, nil
+end
+
+local function safeGetDAField(obj, fieldName)
+    local ok, value = safeGetProperty(obj, fieldName)
+    if ok and value ~= nil then return value end
+    ok, value = safeGetDirectField(obj, fieldName)
+    if ok then return value end
+    return nil
+end
+
+local function safeGetArray(ps, propName)
+    local ok, arr = safeGetProperty(ps, propName)
+    if ok and arr then return arr end
+    return nil
+end
+
+local function safeGetArrayElement(elem)
+    if not elem then return nil end
+    local okSlot, slot = pcall(function() return elem:get() end)
+    if okSlot and isValidObject(slot) then return slot end
+    return nil
+end
+
 local function computeSlotCounts(ps, propName, daField)
     local counts = {}
     pcall(function()
-        local arr = ps:GetPropertyValue(propName)
+        local arr = safeGetArray(ps, propName)
         if not arr then return end
         arr:ForEach(function(_, elem)
-            if elem:get():IsValid() then
-                local ok, da = pcall(function() return elem:get()[daField] end)
-                if ok and da then
+            local slot = safeGetArrayElement(elem)
+            if slot then
+                local da = safeGetDAField(slot, daField)
+                if da then
                     local name = getDAName(da)
-                    if name ~= "" then
-                        counts[name] = (counts[name] or 0) + 1
-                    end
+                    if name ~= "" then counts[name] = (counts[name] or 0) + 1 end
                 end
             end
         end)
@@ -554,14 +620,14 @@ local function readItemArray(ps, propName, daField)
     local items = {}
     local readable = false
     local okRead = pcall(function()
-        local arr = ps:GetPropertyValue(propName)
+        local arr = safeGetArray(ps, propName)
         if not arr then return end
         readable = true
         arr:ForEach(function(index, elem)
-            local okSlot, slot = pcall(function() return elem:get() end)
-            if not okSlot or not slot:IsValid() then return end
-            local okda, da = pcall(function() return slot[daField] end)
-            if not okda or not da then return end
+            local slot = safeGetArrayElement(elem)
+            if not slot then return end
+            local da = safeGetDAField(slot, daField)
+            if not da then return end
             local name = getDAName(da)
             if name == "" then return end
             local fullDA = getDAFullName(da)
@@ -604,16 +670,13 @@ end
 local function getLocalPS()
     local pc = FindFirstOf("CrabPC")
     if not pc then return nil end
-    local ok, v = pcall(function() return pc:IsValid() end)
-    if not ok or not v then return nil end
+    if not isValidObject(pc) then return nil end
     -- Use GetPropertyValue rather than direct property access (pc.PlayerState).
     -- Direct access hands UE4SS a raw pointer that may be mid-destruction during
     -- a level transition; GetPropertyValue goes through UE4SS's own validity layer
     -- and avoids the native C++ exception that pcall cannot catch.
-    local ok2, ps = pcall(function() return pc:GetPropertyValue("PlayerState") end)
-    if not ok2 or not ps then return nil end
-    local ok3, v3 = pcall(function() return ps:IsValid() end)
-    return (ok3 and v3) and ps or nil
+    local ok, ps = safeGetProperty(pc, "PlayerState")
+    return (ok and isValidObject(ps)) and ps or nil
 end
 
 -- Returns the local player's CrabHC (health component), or nil.
@@ -624,26 +687,20 @@ local function getLocalHC()
     if not ps then return nil end
 
     -- Get pawn from player state (more direct than going through PC).
-    local ok, pawn = pcall(function() return ps:GetPropertyValue("PawnPrivate") end)
-    if not ok or not pawn then return nil end
-    local okv, v = pcall(function() return pawn:IsValid() end)
-    if not okv or not v then return nil end
+    local ok, pawn = safeGetProperty(ps, "PawnPrivate")
+    if not ok or not isValidObject(pawn) then return nil end
 
     -- The health component is stored as property "HC" on the pawn (confirmed from
     -- UE4 object dump: CrabHC .../BP_Destructible_HealthRock...:HC).
-    local ok2, hc = pcall(function() return pawn:GetPropertyValue("HC") end)
-    if ok2 and hc then
-        local ok3, iv = pcall(function() return hc:IsValid() end)
-        if ok3 and iv then return hc end
-    end
+    local ok2, hc = safeGetProperty(pawn, "HC")
+    if ok2 and isValidObject(hc) then return hc end
 
     -- Fall back: scan all CrabHC instances and match via outer == pawn.
     -- UE4SS compares UObject userdata by address so == works correctly here.
     local allHCs = FindAllOf("CrabHC")
     if not allHCs then return nil end
     for _, hc in ipairs(allHCs) do
-        local okh, vh = pcall(function() return hc:IsValid() end)
-        if okh and vh then
+        if isValidObject(hc) then
             local oko, outer = pcall(function() return hc:GetOuter() end)
             if oko and outer then
                 local okeq, eq = pcall(function() return outer == pawn end)
@@ -770,18 +827,13 @@ end
 local function getItemsFromPS(ps, propName, daField)
     local items = {}
     pcall(function()
-        local arr = ps:GetPropertyValue(propName)
+        local arr = safeGetArray(ps, propName)
         if not arr then return end
         arr:ForEach(function(index, elem)
-            local okSlot, slot = pcall(function() return elem:get() end)
-            local slotValid = false
-            if okSlot and slot then
-                local okValid, valid = pcall(function() return slot:IsValid() end)
-                slotValid = okValid and valid
-            end
-            if slotValid then
-                local okDa, da = pcall(function() return slot[daField] end)
-                if okDa and da then
+            local slot = safeGetArrayElement(elem)
+            if slot then
+                local da = safeGetDAField(slot, daField)
+                if da then
                     local name = getDAName(da)
                     if name ~= "" then
                         local fullDA = getDAFullName(da)
@@ -1011,13 +1063,14 @@ end
 local function getArrayOccupancy(ps, propName, daField)
     local filled, total = 0, 0
     pcall(function()
-        local arr = ps:GetPropertyValue(propName)
+        local arr = safeGetArray(ps, propName)
         if not arr then return end
         arr:ForEach(function(_, elem)
-            if not elem:get():IsValid() then return end
+            local slot = safeGetArrayElement(elem)
+            if not slot then return end
             total = total + 1
-            local ok, da = pcall(function() return elem:get()[daField] end)
-            if not ok or not da then return end
+            local da = safeGetDAField(slot, daField)
+            if not da then return end
             local name = getDAName(da)
             if name ~= "" then filled = filled + 1 end
         end)
@@ -1054,7 +1107,12 @@ local hasConfirmedValidHealthSample = false
 local ownSlots      = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
 local lastGameSlots = { weaponMods=nil, abilityMods=nil, meleeMods=nil, perks=nil }
 local lastSentPushSeq = 0
-
+local lifecycleState = "suspended"
+local lifecycleGeneration = 0
+local stableTickCount = 0
+local detectedRole = "unknown"
+local lastLifecycleSig = ""
+local lastSkipLogAt = {}
 -- Transient-empty-read debounce for readItemArray.  TArrays occasionally read as
 -- empty for a single tick while the engine is mid-update (e.g. swapping a mod);
 -- that briefly "unequipped" state would otherwise get pushed to the server and
@@ -1262,7 +1320,7 @@ local function readInventory(ps)
     -- On first read the initial value is accepted immediately (no delay).
     if SYNC_WEAPON then
         local cur = ""
-        pcall(function() cur = getDAName(ps.WeaponDA) end)
+        pcall(function() cur = getDAName(safeGetDAField(ps, "WeaponDA")) end)
         if cur ~= pendingWeapon then
             pendingWeapon = cur;  pendingWCount = 1
             if stableWeapon == nil then stableWeapon = cur end   -- accept initial value immediately
@@ -1274,7 +1332,7 @@ local function readInventory(ps)
     end
     if SYNC_ABILITY then
         local cur = ""
-        pcall(function() cur = getDAName(ps.AbilityDA) end)
+        pcall(function() cur = getDAName(safeGetDAField(ps, "AbilityDA")) end)
         if cur ~= pendingAbility then
             pendingAbility = cur;  pendingACount = 1
             if stableAbility == nil then stableAbility = cur end
@@ -1286,7 +1344,7 @@ local function readInventory(ps)
     end
     if SYNC_MELEE then
         local cur = ""
-        pcall(function() cur = getDAName(ps.MeleeDA) end)
+        pcall(function() cur = getDAName(safeGetDAField(ps, "MeleeDA")) end)
         if cur ~= pendingMelee then
             pendingMelee = cur;  pendingMCount = 1
             if stableMelee == nil then stableMelee = cur end
@@ -1299,7 +1357,9 @@ local function readInventory(ps)
 
     if SYNC_CRYSTALS then
         pcall(function()
-            local raw = clampInt(ps:GetPropertyValue(CRYSTALS_PROPERTY), 0, UINT32_MAX)
+            local okCrystals, rawValue = safeGetProperty(ps, CRYSTALS_PROPERTY)
+            if not okCrystals then return end
+            local raw = clampInt(rawValue, 0, UINT32_MAX)
             if lastGameCrystals == nil then
                 -- First ever read: everything is ours (no sync has happened yet).
                 ownCrystals      = raw
@@ -1326,8 +1386,8 @@ local function readInventory(ps)
                 print("[CrabSync:health] health read skipped: HC not ready\n")
                 return
             end
-            local hi = hc:GetPropertyValue("HealthInfo")
-            if not hi then
+            local okHealthInfo, hi = safeGetProperty(hc, "HealthInfo")
+            if not okHealthInfo or not hi then
                 print("[CrabSync:health] health read skipped: HealthInfo not ready\n")
                 return
             end
@@ -1461,7 +1521,9 @@ local function readInventory(ps)
         }
         for _, sp in ipairs(slotProps) do
             pcall(function()
-                local raw = clampInt(ps:GetPropertyValue(sp.prop), 0, BYTE_MAX)
+                local okSlotProp, rawValue = safeGetProperty(ps, sp.prop)
+                if not okSlotProp then return end
+                local raw = clampInt(rawValue, 0, BYTE_MAX)
                 if lastGameSlots[sp.key] == nil then
                     -- First read: treat everything we see as our own contribution.
                     ownSlots[sp.key]      = raw
@@ -1490,8 +1552,12 @@ end
 local function applyInventory(ps, inv)
     local applyReport = { applied=false, partialSkipped=false }
     if not ps or not inv then return applyReport end
-    local ok, valid = pcall(function() return ps:IsValid() end)
-    if not ok or not valid then return applyReport end
+    if lifecycleState ~= "stable" then
+        applyReport.partialSkipped = true
+        print("[CrabSync:apply] apply skipped: lifecycle not stable\n")
+        return applyReport
+    end
+    if not isValidObject(ps) then return applyReport end
 
     local weaponDAs     = SYNC_WEAPON        and FindAllOf("CrabWeaponDA")     or {}
     local abilityDAs    = SYNC_ABILITY       and FindAllOf("CrabAbilityDA")    or {}
@@ -1507,9 +1573,9 @@ local function applyInventory(ps, inv)
         pcall(function()
             -- Only call ServerEquipInventory if a name actually changed — calling
             -- it unnecessarily resets ammo, fire rate, and other weapon state.
-            local curWeapon  = getDAName(ps.WeaponDA)
-            local curAbility = getDAName(ps.AbilityDA)
-            local curMelee   = getDAName(ps.MeleeDA)
+            local curWeapon  = getDAName(safeGetDAField(ps, "WeaponDA"))
+            local curAbility = getDAName(safeGetDAField(ps, "AbilityDA"))
+            local curMelee   = getDAName(safeGetDAField(ps, "MeleeDA"))
             local emptyRecvW = SYNC_WEAPON  and (inv.weapon  or "") == "" and curWeapon  ~= ""
             local emptyRecvA = SYNC_ABILITY and (inv.ability or "") == "" and curAbility ~= ""
             local emptyRecvM = SYNC_MELEE   and (inv.melee   or "") == "" and curMelee   ~= ""
@@ -1544,9 +1610,9 @@ local function applyInventory(ps, inv)
                     tostring(blockedW), tostring(blockedA), tostring(blockedM)))
             end
             if newWeapon == curWeapon and newAbility == curAbility and newMelee == curMelee then return end
-            local weapon  = findDA(weaponDAs,  newWeapon)  or ps.WeaponDA
-            local ability = findDA(abilityDAs, newAbility) or ps.AbilityDA
-            local melee   = findDA(meleeDAs,   newMelee)   or ps.MeleeDA
+            local weapon  = findDA(weaponDAs,  newWeapon)  or safeGetDAField(ps, "WeaponDA")
+            local ability = findDA(abilityDAs, newAbility) or safeGetDAField(ps, "AbilityDA")
+            local melee   = findDA(meleeDAs,   newMelee)   or safeGetDAField(ps, "MeleeDA")
             if weapon and ability and melee then
                 print(string.format(
                     "[CrabSync:apply] ServerEquipInventory → %s / %s / %s\n",
@@ -1583,7 +1649,12 @@ local function applyInventory(ps, inv)
             -- range 0–4,294,967,295.  A pooled server total from many players could exceed
             -- that; clamping prevents a wrap-to-near-zero write that would wipe all crystals.
             local total   = clampInt(inv.crystals, 0, UINT32_MAX)
-            local current = clampInt(ps:GetPropertyValue(CRYSTALS_PROPERTY), 0, UINT32_MAX)
+            local okCrystals, currentValue = safeGetProperty(ps, CRYSTALS_PROPERTY)
+            if not okCrystals then
+                applyReport.partialSkipped = true
+                return
+            end
+            local current = clampInt(currentValue, 0, UINT32_MAX)
             -- Always write the merged total, even if it is lower than the current value.
             -- The delta-tracker in readInventory already anchors lastGameCrystals to
             -- whatever we write here, so the very next tick sees delta = 0 and does NOT
@@ -1630,8 +1701,8 @@ local function applyInventory(ps, inv)
                 applyReport.partialSkipped = true
                 return
             end
-            local hi = hc:GetPropertyValue("HealthInfo")
-            if not hi then
+            local okHealthInfo, hi = safeGetProperty(hc, "HealthInfo")
+            if not okHealthInfo or not hi then
                 print("[CrabSync:health] health apply skipped\n")
                 applyReport.partialSkipped = true
                 return
@@ -1714,7 +1785,7 @@ local function applyInventory(ps, inv)
     local function applySlotArray(propName, daField, daList, sourceNames)
         if #sourceNames == 0 or not daList or #daList == 0 then return end
         pcall(function()
-            local arr = ps:GetPropertyValue(propName)
+            local arr = safeGetArray(ps, propName)
             if not arr then return end
 
             -- Build a mutable wanted-count map from the recv names.
@@ -1727,15 +1798,16 @@ local function applyInventory(ps, inv)
             -- that hold a DA not in the wanted set (need overwriting).
             local dirtySlots = {}
             arr:ForEach(function(_, elem)
-                if not elem:get():IsValid() then return end
-                local ok, da = pcall(function() return elem:get()[daField] end)
-                local curName = (ok and da) and getDAName(da) or ""
+                local slot = safeGetArrayElement(elem)
+                if not slot then return end
+                local da = safeGetDAField(slot, daField)
+                local curName = da and getDAName(da) or ""
                 if wanted[curName] and wanted[curName] > 0 then
                     -- Slot already has a wanted mod.  Mark it satisfied and leave it alone.
                     wanted[curName] = wanted[curName] - 1
                 else
                     -- Slot holds a mod not wanted (or unreadable).  Queue for overwrite.
-                    table.insert(dirtySlots, elem:get())
+                    table.insert(dirtySlots, slot)
                 end
             end)
 
@@ -1933,7 +2005,9 @@ local function applyInventory(ps, inv)
             local incoming = clampInt(inv.slots[entry.key], 0, BYTE_MAX)
             if incoming > 0 then
                 pcall(function()
-                    local current = clampInt(ps:GetPropertyValue(entry.prop), 0, BYTE_MAX)
+                    local okSlotProp, currentValue = safeGetProperty(ps, entry.prop)
+                    if not okSlotProp then return end
+                    local current = clampInt(currentValue, 0, BYTE_MAX)
                     if incoming > current then
                         ps:SetPropertyValue(entry.prop, incoming)
                         -- Anchor the delta tracker to what we just wrote so the very next
@@ -2029,8 +2103,8 @@ end
 -- Level transitions:  isTransitioning is set to true for 4 s when
 -- ClientOnClearedIsland fires, pausing both halves of the poll to avoid
 -- accessing game objects that are mid-destruction (the previous crash source).
--- After the pause both lastPushedJson and lastRecvJson are cleared so the
--- first tick after the new level loads performs a full fresh sync.
+-- After the pause the lifecycle probe must become stable again before the
+-- client can read, push, or apply live game state.
 
 local POLL_INTERVAL_MS = 500   -- how often to check for changes (ms)
 EQUIP_HEALTH_ZERO_GRACE_TICKS = math.max(1, math.ceil(EQUIP_HEALTH_ZERO_GRACE_MS / POLL_INTERVAL_MS))
@@ -2043,7 +2117,6 @@ local lastPushAtSec   = 0      -- os.time() of the last write to PUSH_FILE
 local isTransitioning = false  -- pauses polling during level transitions
 local skipNextApply   = false  -- true for one tick after a push, so bridge can update RECV_FILE
                                -- before we apply (prevents stale recv from reverting a fresh pickup)
-
 -- Crystal delta-tracking — prevents the feedback loop caused by applying the server's
 -- summed total back into the game, which would inflate our contribution on the next push.
 --
@@ -2074,20 +2147,222 @@ local skipNextApply   = false  -- true for one tick after a push, so bridge can 
 -- not the already-synced total (which would cause doubling on every subsequent push).
 -- NOTE: These are forward-declared above the read/apply helpers so all code paths
 -- share one set of upvalues.
+
+local function logRateLimited(key, message, intervalSec)
+    local now = os.time()
+    intervalSec = intervalSec or 5
+    if lastSkipLogAt[key] == nil or (now - lastSkipLogAt[key]) >= intervalSec then
+        lastSkipLogAt[key] = now
+        print(message)
+    end
+end
+
+local function readCurrentRecvText()
+    local f = io.open(RECV_FILE, "r")
+    if not f then return "" end
+    local text = f:read("*a") or ""
+    f:close()
+    return text
+end
+
+local function resetEquipmentDebounce()
+    pendingWeapon  = nil; pendingWCount = 0; stableWeapon  = nil
+    pendingAbility = nil; pendingACount = 0; stableAbility = nil
+    pendingMelee   = nil; pendingMCount = 0; stableMelee   = nil
+end
+
+local function suspendLifecycle(reason)
+    lifecycleGeneration = clampInt(lifecycleGeneration + 1, 0, UINT32_MAX)
+    lifecycleState = "suspended"
+    stableTickCount = 0
+    detectedRole = "unknown"
+    lastLifecycleSig = ""
+    resetItemReadiness()
+    resetEquipmentDebounce()
+    lastPushedJson = ""
+    lastPushAtSec = 0
+    lastRecvJson = readCurrentRecvText()
+    lastRecvInvJson = ""
+    skipNextApply = false
+    lastSentPushSeq = 0
+    print(string.format(
+        "[CrabSync:lifecycle] lifecycle reset reason=%s generation=%d\n",
+        tostring(reason or "unknown"), lifecycleGeneration))
+    print("[CrabSync:lifecycle] lifecycle suspended\n")
+end
+
+local function countValidObjects(className)
+    local count = 0
+    local ok, objects = pcall(function() return FindAllOf(className) end)
+    if not ok or not objects then return count end
+    for _, obj in ipairs(objects) do
+        if isValidObject(obj) then count = count + 1 end
+    end
+    return count
+end
+
+local function detectClientRole(pc, ps)
+    local authority = nil
+    local okAuthority, value = pcall(function() return pc:HasAuthority() end)
+    if okAuthority and type(value) == "boolean" then
+        authority = value
+    else
+        okAuthority, value = pcall(function() return ps:HasAuthority() end)
+        if okAuthority and type(value) == "boolean" then authority = value end
+    end
+
+    local pcCount = countValidObjects("CrabPC")
+    if authority == false then return "joined-client" end
+    if authority == true then
+        if pcCount > 1 then return "host" end
+        return "solo"
+    end
+    return "unknown"
+end
+
+local function lifecycleProbe()
+    if isTransitioning then return false, "transition active", nil end
+
+    local pc = FindFirstOf("CrabPC")
+    if not isValidObject(pc) then return false, "CrabPC not ready", nil end
+
+    local okPS, ps = safeGetProperty(pc, "PlayerState")
+    if not okPS or not isValidObject(ps) then return false, "PlayerState not ready", nil end
+
+    for _, field in ipairs({
+        { flag=SYNC_WEAPON, prop="WeaponDA" },
+        { flag=SYNC_ABILITY, prop="AbilityDA" },
+        { flag=SYNC_MELEE, prop="MeleeDA" },
+    }) do
+        if field.flag then
+            local da = safeGetDAField(ps, field.prop)
+            if not da then return false, field.prop .. " not readable", nil end
+        end
+    end
+
+    if SYNC_CRYSTALS then
+        local ok = safeGetProperty(ps, CRYSTALS_PROPERTY)
+        if not ok then return false, CRYSTALS_PROPERTY .. " not readable", nil end
+    end
+
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        if cat.flag() and not safeGetArray(ps, cat.prop) then
+            return false, cat.prop .. " array not ready", nil
+        end
+    end
+
+    if SYNC_SLOTS then
+        for _, prop in ipairs({ "NumWeaponModSlots", "NumAbilityModSlots", "NumMeleeModSlots", "NumPerkSlots" }) do
+            local ok = safeGetProperty(ps, prop)
+            if not ok then return false, prop .. " not readable", nil end
+        end
+    end
+
+    local role = detectClientRole(pc, ps)
+    if role == "unknown" then return false, "role unknown", { ps=ps, role=role } end
+    return true, "ok", { ps=ps, role=role }
+end
+
+local function updateLifecycle()
+    local ok, reason, ctx = lifecycleProbe()
+    if not ok then
+        if lifecycleState ~= "suspended" or stableTickCount ~= 0 then
+            suspendLifecycle(reason)
+        else
+            logRateLimited("lifecycle-probe-" .. tostring(reason),
+                "[CrabSync:lifecycle] lifecycle suspended: " .. tostring(reason) .. "\n")
+        end
+        return nil
+    end
+
+    local sig = tostring(ctx.role)
+    if lifecycleState == "stable" and sig ~= lastLifecycleSig then
+        suspendLifecycle("role changed")
+        return nil
+    end
+
+    if lifecycleState == "suspended" then
+        lifecycleState = "probing"
+        stableTickCount = 1
+        detectedRole = ctx.role
+        lastLifecycleSig = sig
+        lastRecvJson = readCurrentRecvText()
+        lastRecvInvJson = ""
+        print(string.format(
+            "[CrabSync:lifecycle] lifecycle probing role=%s ticks=%d/%d generation=%d\n",
+            detectedRole, stableTickCount, LIFECYCLE_STABLE_TICKS_REQUIRED, lifecycleGeneration))
+    elseif lifecycleState == "probing" then
+        if sig ~= lastLifecycleSig then
+            suspendLifecycle("role changed during probe")
+            return nil
+        end
+        stableTickCount = stableTickCount + 1
+        if stableTickCount >= LIFECYCLE_STABLE_TICKS_REQUIRED then
+            lifecycleState = "stable"
+            detectedRole = ctx.role
+            print(string.format(
+                "[CrabSync:lifecycle] lifecycle stable role=%s generation=%d\n",
+                detectedRole, lifecycleGeneration))
+        end
+    end
+
+    if lifecycleState ~= "stable" then return nil end
+    ctx.generation = lifecycleGeneration
+    return ctx
+end
+
+local function canPushInLifecycle(ctx)
+    if not ctx or lifecycleState ~= "stable" then
+        return false, "lifecycle not stable"
+    end
+    if ctx.role == "unknown" then
+        return false, "role unknown"
+    end
+    return true, nil
+end
+
+local function canApplyInLifecycle(ctx)
+    if not ctx or lifecycleState ~= "stable" then
+        return false, "lifecycle not stable"
+    end
+    if ctx.role == "unknown" then
+        return false, "role unknown"
+    end
+    if ctx.role == "joined-client" and not ALLOW_JOINED_CLIENT_APPLY then
+        return false, "joined-client apply skipped: read-only safe mode"
+    end
+    if ctx.role ~= "solo" and not ALLOW_MULTIPLAYER_APPLY then
+        return false, "multiplayer apply skipped: disabled"
+    end
+    if HOST_ONLY_APPLY and ctx.role ~= "solo" and ctx.role ~= "host" then
+        return false, "host-only apply skipped: role=" .. tostring(ctx.role)
+    end
+    return true, nil
+end
+
 -- Write PUSH_FILE when inventory changed, plus a periodic keepalive rewrite.
 -- The keepalive prevents stale ghost state after reconnect/server restart:
 -- unchanged inventory still gets re-advertised every FORCE_PUSH_INTERVAL_SEC.
 -- The file is written as {"room":"...","inventory":{...}} so the bridge can
 -- use the correct room for both push POSTs and sync GETs.
 -- Room code comes from config.txt (ROOM_CODE).
-local function pushIfChanged()
-    if isTransitioning then return end
-    local ps = getLocalPS()
-    if not ps then return end
+local function pushIfChanged(ctx)
+    local canPush, pushReason = canPushInLifecycle(ctx)
+    if not canPush then
+        logRateLimited("push-skip-" .. tostring(pushReason),
+            "[CrabSync:push] push skipped: " .. tostring(pushReason) .. "\n")
+        return
+    end
+    local ps = ctx.ps
+    if not isValidObject(ps) then
+        suspendLifecycle("PlayerState invalid before push")
+        return
+    end
 
     local inv = readInventory(ps)
     if inv._itemsReady ~= true then
-        print("[CrabSync:read] item push skipped transient startup read - waiting for stable item arrays\n")
+        logRateLimited("push-skip-items-not-ready",
+            "[CrabSync:push] push skipped: item readiness not stable\n")
         return
     end
     local invJson = encodeInventory(inv)
@@ -2106,12 +2381,17 @@ local function pushIfChanged()
     lastSentPushSeq = clampInt(lastSentPushSeq + 1, 0, UINT32_MAX)
     inv.clientInstanceId = CLIENT_INSTANCE_ID
     inv.pushSeq = lastSentPushSeq
+    inv.lifecycleGeneration = lifecycleGeneration
+    inv.clientRole = ctx.role
+    inv.readOnlySafeMode = (ctx.role == "joined-client" and not ALLOW_JOINED_CLIENT_APPLY)
     local payloadInvJson = encodeInventory(inv)
     local payload = '{"room":' .. jsonStr(ROOM_CODE)
         .. ',"players":' .. playersJson
         .. ',"password":' .. jsonStr(ROOM_PASSWORD)
         .. ',"clientInstanceId":' .. jsonStr(CLIENT_INSTANCE_ID)
         .. ',"pushSeq":' .. tostring(lastSentPushSeq)
+        .. ',"lifecycleGeneration":' .. tostring(lifecycleGeneration)
+        .. ',"clientRole":' .. jsonStr(ctx.role)
         .. ',"inventory":' .. payloadInvJson .. '}'
     local f = io.open(PUSH_FILE, "w")
     if f then
@@ -2133,8 +2413,13 @@ end
 
 -- Apply RECV_FILE to the local player's own PlayerState whenever the bridge
 -- writes a new merged inventory.  Every client does this for themselves.
-local function applyIfChanged()
-    if isTransitioning then return end
+local function applyIfChanged(ctx)
+    local canApply, applyReason = canApplyInLifecycle(ctx)
+    if not canApply then
+        logRateLimited("apply-skip-" .. tostring(applyReason),
+            "[CrabSync:apply] " .. tostring(applyReason) .. "\n")
+        return
+    end
     -- Skip apply for one tick after we pushed: lets the bridge process PUSH_FILE
     -- and update RECV_FILE so we do not immediately apply stale data.
     if skipNextApply then
@@ -2150,6 +2435,13 @@ local function applyIfChanged()
 
     local inv = decodeInventory(json)
     if not inv then return end
+    if inv.lifecycleGeneration ~= nil and inv.lifecycleGeneration ~= lifecycleGeneration then
+        lastRecvJson = json
+        print(string.format(
+            "[CrabSync:apply] apply skipped: stale lifecycle generation recv=%d current=%d\n",
+            inv.lifecycleGeneration, lifecycleGeneration))
+        return
+    end
     local invJson = encodeInventory(inv)
     if invJson == lastRecvInvJson then
         -- Same logical inventory; only raw JSON formatting/order changed.
@@ -2157,8 +2449,11 @@ local function applyIfChanged()
         return
     end
 
-    local ps = getLocalPS()
-    if not ps then return end
+    local ps = ctx.ps
+    if not isValidObject(ps) then
+        suspendLifecycle("PlayerState invalid before apply")
+        return
+    end
     local report = applyInventory(ps, inv) or { applied=false, partialSkipped=false }
     lastRecvJson = json
     lastRecvInvJson = invJson
@@ -2176,8 +2471,9 @@ local function applyIfChanged()
 end
 
 local function pollTick()
-    pushIfChanged()
-    applyIfChanged()
+    local lifecycleContext = updateLifecycle()
+    pushIfChanged(lifecycleContext)
+    applyIfChanged(lifecycleContext)
     ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
 end
 
@@ -2195,13 +2491,10 @@ end
 -- (PlayerState is mid-destruction when this hook fires; defer until safe).
 RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
     isTransitioning = true
+    suspendLifecycle("level transition")
     print("[CrabInventorySync] Level transition — pausing sync for 4 s.\n")
     ExecuteWithDelay(4000, function()
         isTransitioning = false
-        lastPushedJson  = ""   -- force fresh push in the new level
-        lastPushAtSec   = 0
-        lastRecvJson    = ""   -- force fresh apply if RECV_FILE has data
-        lastRecvInvJson = ""
         -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
         -- ownMaxHealth, ownSlots, lastGame* counters).  The game preserves
         -- these values across island clears, so resetting them re-initialises
@@ -2209,27 +2502,16 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         -- pool on every transition.  The existing guards (max(0,...) clamp,
         -- newOwn<=0 re-init, apply anchoring) already handle genuine game
         -- resets (lobby, new run) correctly without a nil reset here.
-        pendingWeapon  = nil;  pendingWCount = 0;  stableWeapon  = nil
-        pendingAbility = nil;  pendingACount = 0;  stableAbility = nil
-        pendingMelee   = nil;  pendingMCount = 0;  stableMelee   = nil
-        resetItemReadiness()
-        print("[CrabInventorySync] Resuming continuous sync.\n")
+        print("[CrabInventorySync] Resuming lifecycle probe.\n")
     end)
 end)
 
 -- F9: force an immediate re-push and re-apply on the very next tick.
 RegisterKeyBind(Key.F9, function()
-    lastPushedJson   = ""
-    lastPushAtSec    = 0
-    lastRecvJson     = ""
-    lastRecvInvJson  = ""
     -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
     -- ownMaxHealth, ownSlots).  Resetting them re-initialises each player's
     -- contribution to the full pooled total, doubling the pool.
-    pendingWeapon  = nil;  pendingWCount = 0;  stableWeapon  = nil
-    pendingAbility = nil;  pendingACount = 0;  stableAbility = nil
-    pendingMelee   = nil;  pendingMCount = 0;  stableMelee   = nil
-    resetItemReadiness()
+    suspendLifecycle("manual sync forced")
     print("[CrabInventorySync] Manual sync forced (F9).\n")
 end)
 

@@ -28,6 +28,15 @@ syncSlots       = true
 # not write InventoryInfo.Level, AccumulatedBuff, or Enhancements while this is false.
 allowScalarMetadataApply = false
 
+# Lifecycle and multiplayer safety gates. The client must pass several shallow
+# stable probes before reading/pushing/applying. Joined clients are read-only by
+# default, and multiplayer applies stay disabled until contribution/role safety is
+# implemented and tested.
+allowJoinedClientApply = false
+allowMultiplayerApply = false
+hostOnlyApply = true
+lifecycleStableTicksRequired = 5
+
 # Internal PlayerState property name for crystals.
 # Health is not configured by property name: current HP is read from
 # CrabHC.HealthInfo.CurrentHealth and max HP from CrabHC.HealthInfo.CurrentMaxHealth.
