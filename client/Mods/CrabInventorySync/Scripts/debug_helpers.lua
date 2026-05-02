@@ -256,12 +256,18 @@ local function onF8()
                 return
             end
             local items = {}
-            arr:ForEach(function(_, elem)
+            arr:ForEach(function(index, elem)
                 local okSlot, slot = pcall(function() return elem:get() end)
-                if okSlot and slot:IsValid() then
+                local slotValid = false
+                if okSlot and slot then
+                    local okValid, valid = pcall(function() return slot:IsValid() end)
+                    slotValid = okValid and valid
+                end
+                if slotValid then
                     local okd, da = pcall(function() return slot[daField] end)
                     if okd and da then
                         local okn, n = pcall(function() return da.Name:ToString() end)
+                        local okFull, fullName = pcall(function() return da:GetFullName() end)
                         local level, accum, enhancements = 1, 0.0, {}
                         pcall(function()
                             local info = slot.InventoryInfo
@@ -273,12 +279,20 @@ local function onF8()
                             end
                         end)
                         table.insert(items, string.format(
-                            "%s (level=%d, accumulatedBuff=%.4f, enhancements=[%s])",
+                            "category=%s, slotIndex=%s, da=%s, fullDA=%s, Level=%d, AccumulatedBuff=%.4f, Enhancements=[%s], valid=%s",
+                            label,
+                            tostring(index),
                             okn and n or "?",
+                            okFull and tostring(fullName) or "?",
                             level,
                             accum,
-                            table.concat(enhancements, ",")))
+                            table.concat(enhancements, ","),
+                            tostring(slotValid)))
                     end
+                else
+                    table.insert(items, string.format(
+                        "category=%s, slotIndex=%s, da=?, fullDA=?, Level=?, AccumulatedBuff=?, Enhancements=[], valid=%s",
+                        label, tostring(index), tostring(slotValid)))
                 end
             end)
             if #items == 0 then

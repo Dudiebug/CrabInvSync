@@ -38,8 +38,9 @@ local SYNC_ABILITY_MODS  = true
 local SYNC_MELEE_MODS    = true
 local SYNC_PERKS         = true
 local SYNC_RELICS        = true
-local SYNC_HEALTH        = true
+local SYNC_HEALTH        = false
 local SYNC_SLOTS         = true
+local ALLOW_SCALAR_METADATA_APPLY = false
 -- Internal property name for crystals on CrabPS (adjust if values read as 0)
 local CRYSTALS_PROPERTY  = "Crystals"
 -- Shared secret sent with every push to keep the server endpoint private.
@@ -159,6 +160,7 @@ local function loadConfig()
         syncRelics       = function(v) SYNC_RELICS       = (v == "true") end,
         syncHealth       = function(v) SYNC_HEALTH       = (v == "true") end,
         syncSlots        = function(v) SYNC_SLOTS        = (v == "true") end,
+        allowScalarMetadataApply = function(v) ALLOW_SCALAR_METADATA_APPLY = (v == "true") end,
     }
 
     local lineNo = 0
@@ -311,20 +313,55 @@ local function readEnhancementArray(enhancements)
     return out
 end
 
--- Encode an array of inventory items as JSON objects {n,l,a,e}.
+-- Encode an array of inventory items as JSON objects {n,l,a,e}, plus optional
+-- slot/identity hints used only for future safe-pairing checks.
 -- n = DA name, l = level (ByteProperty, 1-255), a = AccumulatedBuff (float),
 -- e = InventoryInfo.Enhancements enum array.
 -- This is the new payload format for weaponMods/abilityMods/meleeMods/perks/relics.
 local function jsonItemArray(items)
     local parts = {}
     for _, item in ipairs(items) do
-        table.insert(parts, string.format('{"n":%s,"l":%d,"a":%s,"e":%s}',
-            jsonStr(item.name or ""),
-            clampInt(item.level, ITEM_LEVEL_MIN, BYTE_MAX),
-            jsonNumber(item.accum, 4),
-            jsonIntArray(item.enhancements or item.e)))
+        local fields = {
+            '"n":' .. jsonStr(item.name or item.n or ""),
+            '"l":' .. tostring(clampInt(item.level or item.l, ITEM_LEVEL_MIN, BYTE_MAX)),
+            '"a":' .. jsonNumber(item.accum or item.a, 4),
+            '"e":' .. jsonIntArray(item.enhancements or item.e),
+        }
+        local slotIndex = item.slotIndex or item.index or item.i
+        if slotIndex ~= nil then
+            table.insert(fields, '"i":' .. tostring(clampInt(slotIndex, 0, UINT32_MAX)))
+        end
+        local fullDA = item.fullDA or item.daFullName or item.d
+        if fullDA and fullDA ~= "" then
+            table.insert(fields, '"d":' .. jsonStr(fullDA))
+        end
+        table.insert(parts, "{" .. table.concat(fields, ",") .. "}")
     end
     return "[" .. table.concat(parts, ",") .. "]"
+end
+
+local function jsonUnescape(s)
+    if type(s) ~= "string" then return "" end
+    return s
+        :gsub('\\"', '"')
+        :gsub('\\\\', '\\')
+        :gsub('\\n', '\n')
+        :gsub('\\r', '\r')
+        :gsub('\\t', '\t')
+        :gsub('\\b', '\b')
+        :gsub('\\f', '\f')
+end
+
+local function parseOptionalSlotIndex(obj)
+    local raw = obj and obj:match('"i"%s*:%s*(%d+)')
+    if raw == nil then return nil end
+    return clampInt(raw, 0, UINT32_MAX)
+end
+
+local function parseOptionalFullDA(obj)
+    local raw = obj and obj:match('"d"%s*:%s*"([^"]*)"')
+    if not raw or raw == "" then return "" end
+    return jsonUnescape(raw)
 end
 
 -- Decode an array of inventory items from the JSON produced by jsonItemArray.
@@ -353,8 +390,10 @@ local function parseItemArray(json, key)
             local level = clampInt(obj:match('"l"%s*:%s*(%d+)'), ITEM_LEVEL_MIN, BYTE_MAX)
             local accum = tonumber(obj:match('"a"%s*:%s*(%-?[%d%.]+)')) or 0.0
             local enhancements = parseEnhancementArray(obj:match('"e"%s*:%s*(%[[^%]]*%])'))
+            local slotIndex = parseOptionalSlotIndex(obj)
+            local fullDA = parseOptionalFullDA(obj)
             if name and name ~= "" then
-                table.insert(t, { name=name, level=level, accum=accum, enhancements=enhancements })
+                table.insert(t, { name=name, level=level, accum=accum, enhancements=enhancements, slotIndex=slotIndex, fullDA=fullDA })
             end
             pos = objE + 1
         end
@@ -464,6 +503,15 @@ local function getDAName(da)
     return (ok2 and name) and name or ""
 end
 
+local function getDAFullName(da)
+    if not da then return "" end
+    local ok, v = pcall(function() return da:IsValid() end)
+    if not ok or not v then return "" end
+    local okFull, fullName = pcall(function() return da:GetFullName() end)
+    if okFull and fullName then return tostring(fullName) end
+    return getDAName(da)
+end
+
 local function findDA(daList, name)
     if not daList or name == "" then return nil end
     for _, da in ipairs(daList) do
@@ -509,26 +557,36 @@ local function readItemArray(ps, propName, daField)
         local arr = ps:GetPropertyValue(propName)
         if not arr then return end
         readable = true
-        arr:ForEach(function(_, elem)
-            if not elem:get():IsValid() then return end
-            local okda, da = pcall(function() return elem:get()[daField] end)
+        arr:ForEach(function(index, elem)
+            local okSlot, slot = pcall(function() return elem:get() end)
+            if not okSlot or not slot:IsValid() then return end
+            local okda, da = pcall(function() return slot[daField] end)
             if not okda or not da then return end
             local name = getDAName(da)
             if name == "" then return end
+            local fullDA = getDAFullName(da)
             local level, accum, enhancements = 1, 0.0, {}
             pcall(function()
-                local info = elem:get().InventoryInfo
+                local info = slot.InventoryInfo
                 if info then
                     level = clampInt(info.Level, ITEM_LEVEL_MIN, BYTE_MAX)
                     accum = tonumber(info.AccumulatedBuff) or 0.0
                     enhancements = readEnhancementArray(info.Enhancements)
                 end
             end)
-            table.insert(items, { name=name, level=level, accum=accum, enhancements=enhancements })
+            table.insert(items, {
+                name=name,
+                level=level,
+                accum=accum,
+                enhancements=enhancements,
+                slotIndex=index,
+                fullDA=fullDA,
+                valid=true,
+            })
         end)
     end)
-    -- Sort by name so the encoded JSON is deterministic regardless of TArray order.
-    table.sort(items, function(a, b) return a.name < b.name end)
+    -- Preserve live slot traversal order in the payload. Sorting is reserved for
+    -- comparison/signature helpers and is never used for mutation pairing.
     return items, (readable and okRead)
 end
 
@@ -633,6 +691,8 @@ local function normalizeItem(item)
         level = clampInt(item.level or item.l, ITEM_LEVEL_MIN, BYTE_MAX),
         accum = normalizedAccum(item.accum or item.a),
         enhancements = normalizeEnhancementList(item.enhancements or item.e),
+        slotIndex = item.slotIndex or item.index or item.i,
+        fullDA = tostring(item.fullDA or item.daFullName or item.d or ""),
     }
 end
 
@@ -714,11 +774,17 @@ local function getItemsFromPS(ps, propName, daField)
         if not arr then return end
         arr:ForEach(function(index, elem)
             local okSlot, slot = pcall(function() return elem:get() end)
-            if okSlot and slot:IsValid() then
+            local slotValid = false
+            if okSlot and slot then
+                local okValid, valid = pcall(function() return slot:IsValid() end)
+                slotValid = okValid and valid
+            end
+            if slotValid then
                 local okDa, da = pcall(function() return slot[daField] end)
                 if okDa and da then
                     local name = getDAName(da)
                     if name ~= "" then
+                        local fullDA = getDAFullName(da)
                         local level, accum, enhancements, info = ITEM_LEVEL_MIN, 0.0, {}, nil
                         pcall(function()
                             info = slot.InventoryInfo
@@ -736,6 +802,9 @@ local function getItemsFromPS(ps, propName, daField)
                             slot=slot,
                             info=info,
                             index=index,
+                            slotIndex=index,
+                            fullDA=fullDA,
+                            valid=true,
                         })
                     end
                 end
@@ -745,52 +814,106 @@ local function getItemsFromPS(ps, propName, daField)
     return items
 end
 
-local function pairItemsByName(gameItems, recvItems)
-    local gameGroups = groupItemsByName(gameItems)
-    local recvGroups = groupItemsByName(recvItems)
+local function itemIdentityKey(item)
+    local normalized = normalizeItem(item)
+    if normalized.fullDA ~= "" then return normalized.fullDA end
+    return normalized.name
+end
+
+local function hasDuplicateIdentity(items)
+    local counts = {}
+    for _, item in ipairs(items or {}) do
+        local key = itemIdentityKey(item)
+        if key ~= "" then
+            counts[key] = (counts[key] or 0) + 1
+            if counts[key] > 1 then return true, key end
+        end
+    end
+    return false, nil
+end
+
+local function pairItemsBySlotIdentity(gameItems, recvItems)
+    local liveBySlot = {}
+    local recvBySlot = {}
+
+    for _, live in ipairs(gameItems or {}) do
+        if live.slotIndex == nil and live.index ~= nil then live.slotIndex = live.index end
+        if live.slotIndex == nil then
+            return nil, "unsafe pairing"
+        end
+        if liveBySlot[live.slotIndex] then
+            return nil, "unsafe pairing"
+        end
+        liveBySlot[live.slotIndex] = live
+    end
+
+    for _, item in ipairs(recvItems or {}) do
+        local incoming = normalizeItem(item)
+        if incoming.slotIndex == nil then
+            return nil, "unsafe pairing"
+        end
+        if recvBySlot[incoming.slotIndex] then
+            return nil, "unsafe pairing"
+        end
+        recvBySlot[incoming.slotIndex] = incoming
+    end
+
     local pairsOut = {}
-
-    for name, gameGroup in pairs(gameGroups) do
-        local recvGroup = recvGroups[name] or {}
-        if #gameGroup ~= #recvGroup then
-            return nil, string.format("unable to pair safely for %s: game=%d recv=%d", name, #gameGroup, #recvGroup)
+    for slotIndex, incoming in pairs(recvBySlot) do
+        local live = liveBySlot[slotIndex]
+        if not live then
+            return nil, "unsafe pairing"
         end
-    end
-    for name, recvGroup in pairs(recvGroups) do
-        local gameGroup = gameGroups[name] or {}
-        if #gameGroup ~= #recvGroup then
-            return nil, string.format("unable to pair safely for %s: game=%d recv=%d", name, #gameGroup, #recvGroup)
+        if live.fullDA == nil or live.fullDA == "" or incoming.fullDA == nil or incoming.fullDA == "" then
+            return nil, "unsafe pairing"
         end
-    end
-
-    for name, gameGroup in pairs(gameGroups) do
-        local recvGroup = recvGroups[name] or {}
-        table.sort(gameGroup, function(a, b)
-            local sigA, sigB = itemSignature(a), itemSignature(b)
-            if sigA == sigB then return (a.index or 0) < (b.index or 0) end
-            return sigA < sigB
-        end)
-        table.sort(recvGroup, function(a, b)
-            return itemSignature(a) < itemSignature(b)
-        end)
-        for i = 1, #gameGroup do
-            table.insert(pairsOut, { live=gameGroup[i], incoming=normalizeItem(recvGroup[i]) })
+        if live.fullDA ~= incoming.fullDA then
+            return nil, "DA mismatch"
         end
+        table.insert(pairsOut, { live=live, incoming=incoming })
     end
 
-    table.sort(pairsOut, function(a, b)
-        local sigA = itemSignature(a.incoming)
-        local sigB = itemSignature(b.incoming)
-        if sigA == sigB then return (a.live.index or 0) < (b.live.index or 0) end
-        return sigA < sigB
-    end)
     return pairsOut, nil
 end
 
-local function applyScalarMetadataForPairs(label, gameItems, recvItems)
-    local pairsOut, err = pairItemsByName(gameItems, recvItems)
+local function logMetadataSkip(label, reason)
+    print(string.format("[CrabSync:apply] %s metadata write skipped: %s\n", label, reason))
+end
+
+local function applyScalarMetadataForPairs(label, gameItems, recvItems, guard)
+    guard = guard or {}
+
+    if not ALLOW_SCALAR_METADATA_APPLY then
+        print(string.format("[CrabSync:apply] %s metadata compared but not written: scalar apply disabled\n", label))
+        logMetadataSkip(label, "scalar apply disabled")
+        return false
+    end
+    if guard.staleRecv then
+        logMetadataSkip(label, "stale recv")
+        return false
+    end
+    if guard.lessCompleteRecv or itemReadinessReady ~= true then
+        logMetadataSkip(label, "unsafe pairing")
+        return false
+    end
+
+    local liveDup, liveDupKey = hasDuplicateIdentity(gameItems)
+    local recvDup, recvDupKey = hasDuplicateIdentity(recvItems)
+    if liveDup or recvDup then
+        logMetadataSkip(label, "duplicate ambiguity")
+        print(string.format(
+            "[CrabSync:apply] %s duplicate ambiguity detail: %s\n",
+            label, tostring(liveDupKey or recvDupKey or "?")))
+        return false
+    end
+
+    local pairsOut, err = pairItemsBySlotIdentity(gameItems, recvItems)
     if not pairsOut then
-        print(string.format("[CrabSync:apply] %s scalar metadata skipped: %s\n", label, err or "unable to pair safely"))
+        if err == "DA mismatch" then
+            logMetadataSkip(label, "DA mismatch")
+        else
+            logMetadataSkip(label, "unsafe pairing")
+        end
         return false
     end
 
@@ -827,7 +950,7 @@ local function applyScalarMetadataForPairs(label, gameItems, recvItems)
             if enhancementSignature(live.enhancements) ~= enhancementSignature(incoming.enhancements) then
                 enhancementSkipped = enhancementSkipped + 1
                 print(string.format(
-                    "[CrabSync:apply] %s enhancement mismatch skipped for %s: game=[%s] recv=[%s]\n",
+                    "[CrabSync:apply] %s enhancement mismatch compared but not written for %s: game=[%s] recv=[%s]\n",
                     label, live.name, enhancementSignature(live.enhancements), enhancementSignature(incoming.enhancements)))
             end
         end
@@ -964,7 +1087,14 @@ local function cloneItem(item)
     local src = normalizeItem(item)
     local enhancements = {}
     for _, value in ipairs(src.enhancements or {}) do table.insert(enhancements, value) end
-    return { name=src.name, level=src.level, accum=src.accum, enhancements=enhancements }
+    return {
+        name=src.name,
+        level=src.level,
+        accum=src.accum,
+        enhancements=enhancements,
+        slotIndex=src.slotIndex,
+        fullDA=src.fullDA,
+    }
 end
 
 local function cloneItemArraysFrom(inv)
@@ -1039,10 +1169,25 @@ local function itemCountsEqualByName(left, right)
     return true
 end
 
+local function itemListLessCompleteThanReference(candidate, reference)
+    if not candidate or not reference then return false end
+    if #candidate < #reference then return true end
+
+    local candidateCounts = itemCountsByName(candidate)
+    local referenceCounts = itemCountsByName(reference)
+    for name, count in pairs(referenceCounts) do
+        if (candidateCounts[name] or 0) < count then return true end
+    end
+    return false
+end
+
 local function resetItemReadiness()
     itemReadinessCandidateSig = nil
     itemReadinessCandidateTicks = 0
     itemReadinessReady = false
+    itemReadinessStableState = nil
+    lastNonEmptyItems = {}
+    emptyReadStreak = {}
 end
 
 local function updateItemReadiness(inv, readable)
@@ -1271,9 +1416,8 @@ local function readInventory(ps)
 
     -- Read full item data (name + Level + AccumulatedBuff) from each TArray slot.
     -- readItemArray reads InventoryInfo directly from the struct so Level and
-    -- AccumulatedBuff are captured in the push payload.  Results are sorted by name
-    -- so the JSON is deterministic regardless of UE4 TArray internal ordering —
-    -- this eliminates the false-positive change detection that caused the shuffle bug.
+    -- AccumulatedBuff are captured in the push payload. Slot traversal order is
+    -- preserved; sorted signatures are only used for comparison/no-op detection.
     local itemReadable = {}
     for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
         if cat.flag() then
@@ -1595,12 +1739,15 @@ local function applyInventory(ps, inv)
                 end
             end)
 
-            -- Collect the mods still needed (unsatisfied entries in wanted).
+            -- Collect the mods still needed in incoming payload order. Sorted
+            -- signatures are comparison-only; they are not used for mutation.
             local modsToPlace = {}
-            for name, count in pairs(wanted) do
-                for _ = 1, count do table.insert(modsToPlace, name) end
+            for _, name in ipairs(sourceNames) do
+                if wanted[name] and wanted[name] > 0 then
+                    table.insert(modsToPlace, name)
+                    wanted[name] = wanted[name] - 1
+                end
             end
-            table.sort(modsToPlace)
 
             -- Pass 2: write unsatisfied mods into dirty slots only.
             -- Slots with correct mods are never touched — their Level and Enhancements
@@ -1630,14 +1777,19 @@ local function applyInventory(ps, inv)
     --   live with the slot, not the DA).  Result: mod names rotate between slots while
     --   their Levels stay behind — the "shuffle" bug.  Skipping the write when
     --   metadata signatures match prevents this entirely.
-    for _, entry in ipairs({
-        { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  da="WeaponModDA",  list=weaponModDAs,  src=inv.weaponMods,  key="weaponMods"  },
-        { flag=SYNC_ABILITY_MODS, prop="AbilityMods", da="AbilityModDA", list=abilityModDAs, src=inv.abilityMods, key="abilityMods" },
-        { flag=SYNC_MELEE_MODS,   prop="MeleeMods",   da="MeleeModDA",   list=meleeModDAs,   src=inv.meleeMods,   key="meleeMods"   },
-        { flag=SYNC_PERKS,        prop="Perks",       da="PerkDA",       list=perkDAs,       src=inv.perks,       key="perks"       },
-        { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      list=relicDAs,      src=inv.relics,      key="relics"      },
-    }) do
-        if entry.flag then
+    if itemReadinessReady ~= true then
+        applyReport.partialSkipped = true
+        print("[CrabSync:apply] item apply skipped: local item readiness not stable\n")
+        print("[CrabSync:apply] item apply skipped: readiness false\n")
+    else
+        for _, entry in ipairs({
+            { flag=SYNC_WEAPON_MODS,  prop="WeaponMods",  da="WeaponModDA",  list=weaponModDAs,  src=inv.weaponMods,  key="weaponMods"  },
+            { flag=SYNC_ABILITY_MODS, prop="AbilityMods", da="AbilityModDA", list=abilityModDAs, src=inv.abilityMods, key="abilityMods" },
+            { flag=SYNC_MELEE_MODS,   prop="MeleeMods",   da="MeleeModDA",   list=meleeModDAs,   src=inv.meleeMods,   key="meleeMods"   },
+            { flag=SYNC_PERKS,        prop="Perks",       da="PerkDA",       list=perkDAs,       src=inv.perks,       key="perks"       },
+            { flag=SYNC_RELICS,       prop="Relics",      da="RelicDA",      list=relicDAs,      src=inv.relics,      key="relics"      },
+        }) do
+            if entry.flag then
             -- entry.src is an array of {name,level,accum,enhancements} objects.
             -- Compare full metadata signatures first; only DA-name mismatches can
             -- trigger slot writes.
@@ -1646,8 +1798,15 @@ local function applyInventory(ps, inv)
             local gameItems = getItemsFromPS(ps, entry.prop, entry.da)
             local recvIsSelfEcho = (inv.clientInstanceId ~= nil and inv.clientInstanceId ~= "" and inv.clientInstanceId == CLIENT_INSTANCE_ID)
             local recvPushSeq = clampInt(inv.pushSeq, 0, UINT32_MAX)
-            local oldSelfEcho = recvIsSelfEcho and recvPushSeq > 0 and recvPushSeq < lastSentPushSeq
-            local lessCompleteRecv = (#recvItems < #gameItems) and (hasStableItemCategory(entry.key) or itemReadinessReady ~= true)
+            local oldSelfEcho = recvIsSelfEcho and recvPushSeq < lastSentPushSeq
+            local stableItems = (itemReadinessStableState and itemReadinessStableState[entry.key]) or nil
+            local lessCompleteRecv = (#recvItems < #gameItems) or itemListLessCompleteThanReference(recvItems, stableItems)
+            local recvNames = {}
+            for _, item in ipairs(recvItems) do table.insert(recvNames, item.name) end
+            local metadataGuard = {
+                staleRecv = oldSelfEcho,
+                lessCompleteRecv = lessCompleteRecv,
+            }
             local structuralApplyBlocked = false
 
             if oldSelfEcho then
@@ -1656,6 +1815,9 @@ local function applyInventory(ps, inv)
                 print(string.format(
                     "[CrabSync:apply] structural apply skipped: self echo - %s recvSeq=%d localSeq=%d\n",
                     entry.prop, recvPushSeq, lastSentPushSeq))
+                print(string.format(
+                    "[CrabSync:apply] %s metadata write skipped: stale recv\n",
+                    entry.prop))
             end
             if lessCompleteRecv then
                 structuralApplyBlocked = true
@@ -1663,12 +1825,9 @@ local function applyInventory(ps, inv)
                 print(string.format(
                     "[CrabSync:apply] structural apply skipped: less-complete recv - startup/self-echo less-complete recv skipped. %s game=%d recv=%d stable=%s\n",
                     entry.prop, #gameItems, #recvItems, tostring(hasStableItemCategory(entry.key))))
-            elseif recvIsSelfEcho and #recvItems < #gameItems then
-                structuralApplyBlocked = true
-                applyReport.partialSkipped = true
                 print(string.format(
-                    "[CrabSync:apply] structural apply skipped: self echo - %s less complete game=%d recv=%d\n",
-                    entry.prop, #gameItems, #recvItems))
+                    "[CrabSync:apply] %s metadata write skipped: unsafe pairing\n",
+                    entry.prop))
             end
 
             local diff = compareItemMetadata(gameItems, recvItems)
@@ -1678,14 +1837,14 @@ local function applyInventory(ps, inv)
                     "[CrabSync:apply] %s reorder-only no-op - item metadata signatures match\n",
                     entry.prop))
             elseif diff.kind == "same" then
-                if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems, metadataGuard) then
                     applyReport.applied = true
                 end
             elseif diff.metadataMismatch then
                 print(string.format(
                     "[CrabSync:apply] %s metadata differs (%s) - no slot rebuild\n",
                     entry.prop, diff.kind))
-                if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems, metadataGuard) then
                     applyReport.applied = true
                 end
             elseif diff.slotWriteCandidate then
@@ -1720,7 +1879,7 @@ local function applyInventory(ps, inv)
                 local hasVacancy = totalSlots > filledSlots
                 if structuralApplyBlocked then
                     if itemCountsEqualByName(gameItems, recvItems) then
-                        if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                        if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems, metadataGuard) then
                             applyReport.applied = true
                         end
                     end
@@ -1733,10 +1892,13 @@ local function applyInventory(ps, inv)
                         "[CrabSync:apply] %s name mismatch (%d game / %d recv, slots %d/%d) - writing slots\n",
                         entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
                     -- applySlotArray expects a flat name list for its wanted-set logic.
-                    applySlotArray(entry.prop, entry.da, entry.list, sortedSrc)
+                    applySlotArray(entry.prop, entry.da, entry.list, recvNames)
                     applyReport.applied = true
                     local postWriteItems = getItemsFromPS(ps, entry.prop, entry.da)
-                    if applyScalarMetadataForPairs(entry.prop, postWriteItems, recvItems) then
+                    print(string.format(
+                        "[CrabSync:apply] %s structural apply metadata preservation not guaranteed; risky metadata writes remain quarantined\n",
+                        entry.prop))
+                    if applyScalarMetadataForPairs(entry.prop, postWriteItems, recvItems, metadataGuard) then
                         applyReport.applied = true
                     end
                 else
@@ -1744,10 +1906,11 @@ local function applyInventory(ps, inv)
                         "[CrabSync:apply] %s name mismatch (%d game / %d recv, slots %d/%d) - no safe slot write\n",
                         entry.prop, #gameSorted, #sortedSrc, filledSlots, totalSlots))
                     applyReport.partialSkipped = true
-                    if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems) then
+                    if applyScalarMetadataForPairs(entry.prop, gameItems, recvItems, metadataGuard) then
                         applyReport.applied = true
                     end
                 end
+            end
             end
         end
     end

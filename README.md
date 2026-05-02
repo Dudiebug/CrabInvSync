@@ -66,6 +66,7 @@ Edit `Mods/CrabInventorySync/Scripts/config.txt`:
 | `syncPerks` | `true` | Sync perk list |
 | `syncRelics` | `true` | Sync relic list |
 | `syncSlots` | `true` | Sync mod/perk slot counts (SetPropertyValue only — no UFunctions) |
+| `allowScalarMetadataApply` | `false` | Safety gate for item `InventoryInfo` scalar writes; keep disabled |
 | `crystalsProperty` | `Crystals` | Internal PlayerState property name for crystals |
 
 Runtime IPC files are per game launch: `push_<instance>.json` and
@@ -78,13 +79,13 @@ There is no `healthProperty` config key. Current HP is read from
 not read, send, or apply health. Armor plates are currently local-only.
 
 Keys are not synced. Item payloads preserve `InventoryInfo.Level`,
-`InventoryInfo.AccumulatedBuff`, and `InventoryInfo.Enhancements` as `e`. The
-apply gate compares the full item metadata signature, so reorder-only changes
-are ignored while level, buff, and enhancement differences are detected. When
-live and incoming item names/counts can be paired safely, the client applies
-scalar `Level` and `AccumulatedBuff` updates to existing slots. It still does
-not write nested enhancement TArrays back into item slots until that path has
-in-game-safe write testing.
+`InventoryInfo.AccumulatedBuff`, and `InventoryInfo.Enhancements` as `{n,l,a,e}`.
+The client still reads, encodes, decodes, merges, and compares that metadata:
+reorder-only changes are ignored while level, buff, and enhancement differences
+are detected and logged. Scalar metadata apply is quarantined by default with
+`allowScalarMetadataApply=false`, so the client does not write `Level`,
+`AccumulatedBuff`, or nested `Enhancements` back into live item structs until
+stable slot identity and duplicate-free pairing are proven.
 
 ## Server dashboard
 

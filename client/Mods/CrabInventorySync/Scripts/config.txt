@@ -23,6 +23,11 @@ syncRelics      = true
 syncHealth      = false
 syncSlots       = true
 
+# Scalar item metadata writes are quarantined until stable slot identity is proven.
+# The client still reads, sends, receives, merges, and compares {n,l,a,e}; it does
+# not write InventoryInfo.Level, AccumulatedBuff, or Enhancements while this is false.
+allowScalarMetadataApply = false
+
 # Internal PlayerState property name for crystals.
 # Health is not configured by property name: current HP is read from
 # CrabHC.HealthInfo.CurrentHealth and max HP from CrabHC.HealthInfo.CurrentMaxHealth.
