@@ -43,8 +43,14 @@ local SYNC_SLOTS         = true
 local ALLOW_SCALAR_METADATA_APPLY = false
 local ALLOW_JOINED_CLIENT_APPLY = false
 local ALLOW_MULTIPLAYER_APPLY = false
+local ALLOW_JOINED_CLIENT_READ = false
+local ALLOW_UNKNOWN_ROLE_READ = false
+local ALLOW_DEEP_ITEM_ARRAY_READ = true
 local HOST_ONLY_APPLY = true
 local LIFECYCLE_STABLE_TICKS_REQUIRED = 5
+local LIFECYCLE_STABLE_WARMUP_TICKS = 10
+local ITEM_ARRAY_WARMUP_TICKS_REQUIRED = 10
+local DEBUG_CRASH_BREADCRUMBS = false
 -- Internal property name for crystals on CrabPS (adjust if values read as 0)
 local CRYSTALS_PROPERTY  = "Crystals"
 -- Shared secret sent with every push to keep the server endpoint private.
@@ -128,6 +134,19 @@ end
 -- fields or malformed.  pollTick / autoLaunchBridge check this before doing
 -- anything that would fail silently downstream.
 CONFIG_VALID = true
+local invalidConfigLogged = false
+
+local function logInvalidConfigDisabledOnce()
+    if invalidConfigLogged then return end
+    invalidConfigLogged = true
+    print("[CrabInventorySync] sync disabled: invalid config\n")
+end
+
+local function crashBreadcrumb(phase, state)
+    if DEBUG_CRASH_BREADCRUMBS then
+        print(string.format("[CrabSync:breadcrumb] %s %s\n", tostring(phase), tostring(state or "")))
+    end
+end
 
 local function loadConfig()
     local configPath = nil
@@ -167,12 +186,28 @@ local function loadConfig()
         allowScalarMetadataApply = function(v) ALLOW_SCALAR_METADATA_APPLY = (v == "true") end,
         allowJoinedClientApply = function(v) ALLOW_JOINED_CLIENT_APPLY = (v == "true") end,
         allowMultiplayerApply = function(v) ALLOW_MULTIPLAYER_APPLY = (v == "true") end,
+        allowJoinedClientRead = function(v) ALLOW_JOINED_CLIENT_READ = (v == "true") end,
+        allowUnknownRoleRead = function(v) ALLOW_UNKNOWN_ROLE_READ = (v == "true") end,
+        allowDeepItemArrayRead = function(v) ALLOW_DEEP_ITEM_ARRAY_READ = (v ~= "false") end,
         hostOnlyApply = function(v) HOST_ONLY_APPLY = (v ~= "false") end,
+        debugCrashBreadcrumbs = function(v) DEBUG_CRASH_BREADCRUMBS = (v == "true") end,
         lifecycleStableTicksRequired = function(v)
             local n = math.floor(tonumber(v) or LIFECYCLE_STABLE_TICKS_REQUIRED)
             if n < 1 then n = 1 end
             if n > 60 then n = 60 end
             LIFECYCLE_STABLE_TICKS_REQUIRED = n
+        end,
+        lifecycleStableWarmupTicks = function(v)
+            local n = math.floor(tonumber(v) or LIFECYCLE_STABLE_WARMUP_TICKS)
+            if n < 1 then n = 1 end
+            if n > 120 then n = 120 end
+            LIFECYCLE_STABLE_WARMUP_TICKS = n
+        end,
+        itemArrayWarmupTicksRequired = function(v)
+            local n = math.floor(tonumber(v) or ITEM_ARRAY_WARMUP_TICKS_REQUIRED)
+            if n < 1 then n = 1 end
+            if n > 120 then n = 120 end
+            ITEM_ARRAY_WARMUP_TICKS_REQUIRED = n
         end,
     }
 
@@ -214,6 +249,11 @@ local function loadConfig()
     if ROOM_CODE == "" then
         print("[CrabInventorySync] ERROR: roomCode is empty in config.txt — sync disabled.\n")
         CONFIG_VALID = false
+    end
+
+    if CONFIG_VALID == false then
+        logInvalidConfigDisabledOnce()
+        return
     end
 
     print("[CrabInventorySync] Config loaded:\n")
@@ -472,10 +512,17 @@ end
 -- Minimal JSON decoder for the specific inventory structure we produce.
 -- Handles both the new item-object format and the legacy flat-string format.
 local function decodeInventory(json)
-    if not json or json == "" then return nil end
+    crashBreadcrumb("decodeInventory", "enter")
+    if not json or json == "" then
+        crashBreadcrumb("decodeInventory", "leave")
+        return nil
+    end
     -- Strip UTF-8 BOM (0xEF 0xBB 0xBF) if present — PowerShell 5 may write it.
     if json:sub(1,3) == "\xEF\xBB\xBF" then json = json:sub(4) end
-    if json:sub(1,1) ~= "{" then return nil end
+    if json:sub(1,1) ~= "{" then
+        crashBreadcrumb("decodeInventory", "leave")
+        return nil
+    end
     local inv = {}
     inv.weapon    = json:match('"weapon"%s*:%s*"([^"]*)"')  or ""
     inv.ability   = json:match('"ability"%s*:%s*"([^"]*)"') or ""
@@ -515,6 +562,7 @@ local function decodeInventory(json)
     inv.lifecycleGeneration = lifecycleRaw and clampInt(lifecycleRaw, 0, UINT32_MAX) or nil
     inv.clientRole = json:match('"clientRole"%s*:%s*"([^"]*)"') or ""
     inv.readOnlySafeMode = (json:match('"readOnlySafeMode"%s*:%s*(%a+)') == "true")
+    crashBreadcrumb("decodeInventory", "leave")
     return inv
 end
 
@@ -617,28 +665,47 @@ end
 -- Reads InventoryInfo directly from each TArray struct element so the push
 -- payload includes per-item Level, AccumulatedBuff, and Enhancements data.
 local function readItemArray(ps, propName, daField)
+    crashBreadcrumb("readItemArray " .. tostring(propName), "enter")
     local items = {}
     local readable = false
     local okRead = pcall(function()
+        crashBreadcrumb("readItemArray " .. tostring(propName) .. " get array", "enter")
         local arr = safeGetArray(ps, propName)
+        crashBreadcrumb("readItemArray " .. tostring(propName) .. " get array", "leave")
         if not arr then return end
         readable = true
+        crashBreadcrumb("readItemArray " .. tostring(propName) .. " ForEach", "enter")
+        local elementBreadcrumbs = 0
         arr:ForEach(function(index, elem)
+            local logElement = elementBreadcrumbs < 3
+            if logElement then
+                elementBreadcrumbs = elementBreadcrumbs + 1
+                crashBreadcrumb("readItemArray " .. tostring(propName) .. " element " .. tostring(index) .. " get", "enter")
+            end
             local slot = safeGetArrayElement(elem)
+            if logElement then
+                crashBreadcrumb("readItemArray " .. tostring(propName) .. " element " .. tostring(index) .. " get", "leave")
+            end
             if not slot then return end
+            if logElement then crashBreadcrumb("readItemArray " .. tostring(propName) .. " DA field " .. tostring(index), "enter") end
             local da = safeGetDAField(slot, daField)
+            if logElement then crashBreadcrumb("readItemArray " .. tostring(propName) .. " DA field " .. tostring(index), "leave") end
             if not da then return end
             local name = getDAName(da)
             if name == "" then return end
             local fullDA = getDAFullName(da)
             local level, accum, enhancements = 1, 0.0, {}
             pcall(function()
+                if logElement then crashBreadcrumb("readItemArray " .. tostring(propName) .. " InventoryInfo " .. tostring(index), "enter") end
                 local info = slot.InventoryInfo
                 if info then
                     level = clampInt(info.Level, ITEM_LEVEL_MIN, BYTE_MAX)
                     accum = tonumber(info.AccumulatedBuff) or 0.0
+                    if logElement then crashBreadcrumb("readItemArray " .. tostring(propName) .. " Enhancements " .. tostring(index), "enter") end
                     enhancements = readEnhancementArray(info.Enhancements)
+                    if logElement then crashBreadcrumb("readItemArray " .. tostring(propName) .. " Enhancements " .. tostring(index), "leave") end
                 end
+                if logElement then crashBreadcrumb("readItemArray " .. tostring(propName) .. " InventoryInfo " .. tostring(index), "leave") end
             end)
             table.insert(items, {
                 name=name,
@@ -650,9 +717,11 @@ local function readItemArray(ps, propName, daField)
                 valid=true,
             })
         end)
+        crashBreadcrumb("readItemArray " .. tostring(propName) .. " ForEach", "leave")
     end)
     -- Preserve live slot traversal order in the payload. Sorting is reserved for
     -- comparison/signature helpers and is never used for mutation pairing.
+    crashBreadcrumb("readItemArray " .. tostring(propName), "leave")
     return items, (readable and okRead)
 end
 
@@ -1110,6 +1179,18 @@ local lastSentPushSeq = 0
 local lifecycleState = "suspended"
 local lifecycleGeneration = 0
 local stableTickCount = 0
+local postStableWarmupTicks = 0
+local fullSyncReady = false
+local hasSuccessfulLocalReadThisGeneration = false
+local hasWrittenPushThisGeneration = false
+local hasCompletedCleanFullReadyLoop = false
+local firstFullSyncReadyAt = nil
+local itemArrayDeepReadReady = false
+local itemArrayWarmupTicks = 0
+local lastItemArrayReadFailed = false
+local lifecycleChangedThisTick = false
+local failedProbeOrReadThisWarmup = false
+local currentPollTick = 0
 local detectedRole = "unknown"
 local lastLifecycleSig = ""
 local lastSkipLogAt = {}
@@ -1303,16 +1384,100 @@ end
 -- ============================================================
 -- INVENTORY READ
 -- ============================================================
-local function readInventory(ps)
+local function markItemArraysUnreadable(inv)
+    inv._itemsReady = false
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        inv[cat.key] = inv[cat.key] or {}
+    end
+end
+
+local function readDeepInventoryItems(ps, inv)
+    crashBreadcrumb("readDeepInventoryItems", "enter")
+    if not ALLOW_DEEP_ITEM_ARRAY_READ then
+        logRateLimited("deep-item-read-disabled",
+            "[CrabSync:read] deep item array read disabled by config\n")
+        markItemArraysUnreadable(inv)
+        crashBreadcrumb("readDeepInventoryItems", "leave")
+        return false
+    end
+    if not itemArrayDeepReadReady then
+        logRateLimited("deep-item-read-gate",
+            "[CrabSync:read] item array read skipped: deep item gate not ready\n")
+        markItemArraysUnreadable(inv)
+        crashBreadcrumb("readDeepInventoryItems", "leave")
+        return false
+    end
+
+    local itemReadable = {}
+    local anyFailed = false
+    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
+        if cat.flag() then
+            local okCat, items, readable = pcall(function()
+                return readItemArray(ps, cat.prop, cat.da)
+            end)
+            local key = cat.key
+            if not okCat or readable ~= true then
+                anyFailed = true
+                itemReadable[key] = false
+                print(string.format("[CrabSync:read] item array read skipped: %s not ready\n", cat.prop))
+                if itemReadinessStableState and itemReadinessStableState[key] then
+                    inv[key] = {}
+                    for _, item in ipairs(itemReadinessStableState[key] or {}) do
+                        table.insert(inv[key], cloneItem(item))
+                    end
+                    inv._itemReadinessReusedStable = true
+                else
+                    inv[key] = lastNonEmptyItems[key] or {}
+                end
+            else
+                itemReadable[key] = true
+                if #items == 0
+                   and lastNonEmptyItems[key]
+                   and (emptyReadStreak[key] or 0) < EMPTY_READ_CONFIRM_TICKS
+                then
+                    emptyReadStreak[key] = (emptyReadStreak[key] or 0) + 1
+                    inv[key] = lastNonEmptyItems[key]
+                else
+                    if #items > 0 then
+                        lastNonEmptyItems[key] = items
+                        emptyReadStreak[key]   = 0
+                    else
+                        emptyReadStreak[key] = (emptyReadStreak[key] or 0) + 1
+                    end
+                    inv[key] = items
+                end
+            end
+        else
+            inv[cat.key] = {}
+            itemReadable[cat.key] = true
+        end
+    end
+
+    lastItemArrayReadFailed = anyFailed
+    updateItemReadiness(inv, itemReadable)
+    crashBreadcrumb("readDeepInventoryItems", "leave")
+    return inv._itemsReady == true
+end
+
+local function readInventory(ps, options)
+    options = options or {}
+    local includeDeepItems = (options.deepItems ~= false)
+    crashBreadcrumb("readInventory", "enter")
     local inv = {
         weapon = "", ability = "", melee = "",
         crystals = 0, keys = 0,
         weaponMods = {}, abilityMods = {}, meleeMods = {}, perks = {}, relics = {},
         slots = { weaponMods=0, abilityMods=0, meleeMods=0, perks=0 }
     }
-    if not ps then return inv end
+    if not ps then
+        crashBreadcrumb("readInventory", "leave")
+        return inv
+    end
     local okv, valid = pcall(function() return ps:IsValid() end)
-    if not okv or not valid then return inv end
+    if not okv or not valid then
+        crashBreadcrumb("readInventory", "leave")
+        return inv
+    end
 
     -- Debounced reads for weapon/ability/melee.  A value must be identical for
     -- SLOT_STABLE_TICKS consecutive polls before it is reported in the push payload.
@@ -1474,6 +1639,9 @@ local function readInventory(ps)
         end)
     end
 
+    if includeDeepItems then
+        readDeepInventoryItems(ps, inv)
+        if false then
     -- Read full item data (name + Level + AccumulatedBuff) from each TArray slot.
     -- readItemArray reads InventoryInfo directly from the struct so Level and
     -- AccumulatedBuff are captured in the push payload. Slot traversal order is
@@ -1508,6 +1676,17 @@ local function readInventory(ps)
     end
 
     updateItemReadiness(inv, itemReadable)
+        end
+    else
+        if includeDeepItems and not ALLOW_DEEP_ITEM_ARRAY_READ then
+            logRateLimited("deep-item-read-disabled",
+                "[CrabSync:read] deep item array read disabled by config\n")
+        elseif includeDeepItems and not itemArrayDeepReadReady then
+            logRateLimited("deep-item-read-gate",
+                "[CrabSync:read] item array read skipped: deep item gate not ready\n")
+        end
+        markItemArraysUnreadable(inv)
+    end
 
     if SYNC_SLOTS then
         -- Delta-tracking for slot counts, identical to the crystals / health pattern.
@@ -1543,30 +1722,51 @@ local function readInventory(ps)
         end
     end
 
+    inv._shallowReadOk = true
+    crashBreadcrumb("readInventory", "leave")
     return inv
+end
+
+local function readShallowInventoryState(ps)
+    return readInventory(ps, { deepItems=false })
 end
 
 -- ============================================================
 -- INVENTORY APPLY
 -- ============================================================
+local function findAllDAWithBreadcrumb(className)
+    crashBreadcrumb("FindAllOf " .. tostring(className), "enter")
+    local result = FindAllOf(className)
+    crashBreadcrumb("FindAllOf " .. tostring(className), "leave")
+    return result or {}
+end
+
 local function applyInventory(ps, inv)
+    crashBreadcrumb("applyInventory", "enter")
     local applyReport = { applied=false, partialSkipped=false }
-    if not ps or not inv then return applyReport end
+    if not ps or not inv then
+        crashBreadcrumb("applyInventory", "leave")
+        return applyReport
+    end
     if lifecycleState ~= "stable" then
         applyReport.partialSkipped = true
         print("[CrabSync:apply] apply skipped: lifecycle not stable\n")
+        crashBreadcrumb("applyInventory", "leave")
         return applyReport
     end
-    if not isValidObject(ps) then return applyReport end
+    if not isValidObject(ps) then
+        crashBreadcrumb("applyInventory", "leave")
+        return applyReport
+    end
 
-    local weaponDAs     = SYNC_WEAPON        and FindAllOf("CrabWeaponDA")     or {}
-    local abilityDAs    = SYNC_ABILITY       and FindAllOf("CrabAbilityDA")    or {}
-    local meleeDAs      = SYNC_MELEE         and FindAllOf("CrabMeleeDA")      or {}
-    local weaponModDAs  = SYNC_WEAPON_MODS   and FindAllOf("CrabWeaponModDA")  or {}
-    local abilityModDAs = SYNC_ABILITY_MODS  and FindAllOf("CrabAbilityModDA") or {}
-    local meleeModDAs   = SYNC_MELEE_MODS    and FindAllOf("CrabMeleeModDA")   or {}
-    local perkDAs       = SYNC_PERKS         and FindAllOf("CrabPerkDA")       or {}
-    local relicDAs      = SYNC_RELICS        and FindAllOf("CrabRelicDA")      or {}
+    local weaponDAs     = SYNC_WEAPON        and findAllDAWithBreadcrumb("CrabWeaponDA")     or {}
+    local abilityDAs    = SYNC_ABILITY       and findAllDAWithBreadcrumb("CrabAbilityDA")    or {}
+    local meleeDAs      = SYNC_MELEE         and findAllDAWithBreadcrumb("CrabMeleeDA")      or {}
+    local weaponModDAs  = SYNC_WEAPON_MODS   and findAllDAWithBreadcrumb("CrabWeaponModDA")  or {}
+    local abilityModDAs = SYNC_ABILITY_MODS  and findAllDAWithBreadcrumb("CrabAbilityModDA") or {}
+    local meleeModDAs   = SYNC_MELEE_MODS    and findAllDAWithBreadcrumb("CrabMeleeModDA")   or {}
+    local perkDAs       = SYNC_PERKS         and findAllDAWithBreadcrumb("CrabPerkDA")       or {}
+    local relicDAs      = SYNC_RELICS        and findAllDAWithBreadcrumb("CrabRelicDA")      or {}
 
     if SYNC_WEAPON or SYNC_ABILITY or SYNC_MELEE then
         local appliedWeapon, appliedAbility, appliedMelee
@@ -1783,7 +1983,11 @@ local function applyInventory(ps, inv)
     --     Pass 2 — fill the collected "dirty" slots with the mods still unsatisfied
     --              from the wanted set.  Only dirty slots are ever written.
     local function applySlotArray(propName, daField, daList, sourceNames)
-        if #sourceNames == 0 or not daList or #daList == 0 then return end
+        crashBreadcrumb("applySlotArray " .. tostring(propName), "enter")
+        if #sourceNames == 0 or not daList or #daList == 0 then
+            crashBreadcrumb("applySlotArray " .. tostring(propName), "leave")
+            return
+        end
         pcall(function()
             local arr = safeGetArray(ps, propName)
             if not arr then return end
@@ -1830,6 +2034,7 @@ local function applyInventory(ps, inv)
                 if da then pcall(function() slotElem[daField] = da end) end
             end
         end)
+        crashBreadcrumb("applySlotArray " .. tostring(propName), "leave")
     end
 
     -- Apply each category then immediately anchor the delta-tracker so the next
@@ -2020,6 +2225,7 @@ local function applyInventory(ps, inv)
             end
         end
     end
+    crashBreadcrumb("applyInventory", "leave")
     return applyReport
 end
 
@@ -2175,6 +2381,17 @@ local function suspendLifecycle(reason)
     lifecycleGeneration = clampInt(lifecycleGeneration + 1, 0, UINT32_MAX)
     lifecycleState = "suspended"
     stableTickCount = 0
+    postStableWarmupTicks = 0
+    fullSyncReady = false
+    hasSuccessfulLocalReadThisGeneration = false
+    hasWrittenPushThisGeneration = false
+    hasCompletedCleanFullReadyLoop = false
+    firstFullSyncReadyAt = nil
+    itemArrayDeepReadReady = false
+    itemArrayWarmupTicks = 0
+    lastItemArrayReadFailed = false
+    lifecycleChangedThisTick = true
+    failedProbeOrReadThisWarmup = false
     detectedRole = "unknown"
     lastLifecycleSig = ""
     resetItemReadiness()
@@ -2215,57 +2432,56 @@ local function detectClientRole(pc, ps)
     if authority == false then return "joined-client" end
     if authority == true then
         if pcCount > 1 then return "host" end
-        return "solo"
+        if pcCount == 1 then return "solo" end
     end
     return "unknown"
 end
 
+local function isRoleFullSyncEligible(role)
+    role = tostring(role or "unknown")
+    if role == "solo" or role == "host" then return true, nil end
+    if role == "joined-client" then
+        if ALLOW_JOINED_CLIENT_READ then return true, nil end
+        return false, "joined-client read disabled"
+    end
+    if role == "unknown" then
+        if ALLOW_UNKNOWN_ROLE_READ then return true, nil end
+        return false, "role unknown"
+    end
+    return false, "role " .. role .. " not eligible"
+end
+
 local function lifecycleProbe()
-    if isTransitioning then return false, "transition active", nil end
+    crashBreadcrumb("lifecycle probe", "enter")
+    if isTransitioning then
+        crashBreadcrumb("lifecycle probe", "leave transition active")
+        return false, "transition active", nil
+    end
 
     local pc = FindFirstOf("CrabPC")
-    if not isValidObject(pc) then return false, "CrabPC not ready", nil end
+    if not isValidObject(pc) then
+        crashBreadcrumb("lifecycle probe", "leave CrabPC not ready")
+        return false, "CrabPC not ready", nil
+    end
 
     local okPS, ps = safeGetProperty(pc, "PlayerState")
-    if not okPS or not isValidObject(ps) then return false, "PlayerState not ready", nil end
-
-    for _, field in ipairs({
-        { flag=SYNC_WEAPON, prop="WeaponDA" },
-        { flag=SYNC_ABILITY, prop="AbilityDA" },
-        { flag=SYNC_MELEE, prop="MeleeDA" },
-    }) do
-        if field.flag then
-            local da = safeGetDAField(ps, field.prop)
-            if not da then return false, field.prop .. " not readable", nil end
-        end
-    end
-
-    if SYNC_CRYSTALS then
-        local ok = safeGetProperty(ps, CRYSTALS_PROPERTY)
-        if not ok then return false, CRYSTALS_PROPERTY .. " not readable", nil end
-    end
-
-    for _, cat in ipairs(ITEM_ARRAY_CATEGORIES) do
-        if cat.flag() and not safeGetArray(ps, cat.prop) then
-            return false, cat.prop .. " array not ready", nil
-        end
-    end
-
-    if SYNC_SLOTS then
-        for _, prop in ipairs({ "NumWeaponModSlots", "NumAbilityModSlots", "NumMeleeModSlots", "NumPerkSlots" }) do
-            local ok = safeGetProperty(ps, prop)
-            if not ok then return false, prop .. " not readable", nil end
-        end
+    if not okPS or not isValidObject(ps) then
+        crashBreadcrumb("lifecycle probe", "leave PlayerState not ready")
+        return false, "PlayerState not ready", nil
     end
 
     local role = detectClientRole(pc, ps)
-    if role == "unknown" then return false, "role unknown", { ps=ps, role=role } end
+    crashBreadcrumb("lifecycle probe", "leave ok")
     return true, "ok", { ps=ps, role=role }
 end
 
 local function updateLifecycle()
+    lifecycleChangedThisTick = false
     local ok, reason, ctx = lifecycleProbe()
     if not ok then
+        if lifecycleState == "stable" or postStableWarmupTicks > 0 then
+            failedProbeOrReadThisWarmup = true
+        end
         if lifecycleState ~= "suspended" or stableTickCount ~= 0 then
             suspendLifecycle(reason)
         else
@@ -2282,6 +2498,7 @@ local function updateLifecycle()
     end
 
     if lifecycleState == "suspended" then
+        lifecycleChangedThisTick = true
         lifecycleState = "probing"
         stableTickCount = 1
         detectedRole = ctx.role
@@ -2298,11 +2515,27 @@ local function updateLifecycle()
         end
         stableTickCount = stableTickCount + 1
         if stableTickCount >= LIFECYCLE_STABLE_TICKS_REQUIRED then
+            crashBreadcrumb("lifecycle stable transition", "enter")
             lifecycleState = "stable"
             detectedRole = ctx.role
+            postStableWarmupTicks = 0
+            fullSyncReady = false
+            hasSuccessfulLocalReadThisGeneration = false
+            hasWrittenPushThisGeneration = false
+            hasCompletedCleanFullReadyLoop = false
+            firstFullSyncReadyAt = nil
+            itemArrayDeepReadReady = false
+            itemArrayWarmupTicks = 0
+            lastItemArrayReadFailed = false
+            failedProbeOrReadThisWarmup = false
+            lifecycleChangedThisTick = true
+            lastRecvJson = readCurrentRecvText()
+            lastRecvInvJson = ""
             print(string.format(
                 "[CrabSync:lifecycle] lifecycle stable role=%s generation=%d\n",
                 detectedRole, lifecycleGeneration))
+            print("[CrabSync:lifecycle] lifecycle stable reached, full sync still blocked\n")
+            crashBreadcrumb("lifecycle stable transition", "leave")
         end
     end
 
@@ -2315,8 +2548,15 @@ local function canPushInLifecycle(ctx)
     if not ctx or lifecycleState ~= "stable" then
         return false, "lifecycle not stable"
     end
-    if ctx.role == "unknown" then
-        return false, "role unknown"
+    local roleOk, roleReason = isRoleFullSyncEligible(ctx.role)
+    if not roleOk then
+        return false, "full sync blocked: " .. tostring(roleReason)
+    end
+    if not fullSyncReady then
+        return false, "full sync not ready"
+    end
+    if not itemArrayDeepReadReady or ALLOW_DEEP_ITEM_ARRAY_READ ~= true then
+        return false, "item array read not ready"
     end
     return true, nil
 end
@@ -2324,6 +2564,22 @@ end
 local function canApplyInLifecycle(ctx)
     if not ctx or lifecycleState ~= "stable" then
         return false, "lifecycle not stable"
+    end
+    if not fullSyncReady then
+        return false, "full sync not ready"
+    end
+    if not hasSuccessfulLocalReadThisGeneration then
+        return false, "local read not ready"
+    end
+    if not hasCompletedCleanFullReadyLoop then
+        return false, "first full-ready loop is read-only"
+    end
+    if not hasWrittenPushThisGeneration then
+        return false, "waiting for same-generation push before apply"
+    end
+    local roleOk, roleReason = isRoleFullSyncEligible(ctx.role)
+    if not roleOk then
+        return false, "full sync blocked: " .. tostring(roleReason)
     end
     if ctx.role == "unknown" then
         return false, "role unknown"
@@ -2338,6 +2594,110 @@ local function canApplyInLifecycle(ctx)
         return false, "host-only apply skipped: role=" .. tostring(ctx.role)
     end
     return true, nil
+end
+
+local function runPostStableWarmup(ctx)
+    if not ctx or lifecycleState ~= "stable" then return nil end
+    if fullSyncReady then return ctx end
+
+    if postStableWarmupTicks < LIFECYCLE_STABLE_WARMUP_TICKS then
+        postStableWarmupTicks = postStableWarmupTicks + 1
+        crashBreadcrumb("warmup tick", tostring(postStableWarmupTicks) .. "/" .. tostring(LIFECYCLE_STABLE_WARMUP_TICKS))
+        if postStableWarmupTicks == 1 then
+            print(string.format(
+                "[CrabSync:lifecycle] post-stable warmup started ticks=%d generation=%d\n",
+                LIFECYCLE_STABLE_WARMUP_TICKS, lifecycleGeneration))
+        end
+        if postStableWarmupTicks >= LIFECYCLE_STABLE_WARMUP_TICKS then
+            print(string.format(
+                "[CrabSync:lifecycle] warmup completed generation=%d\n",
+                lifecycleGeneration))
+        end
+        return nil
+    end
+
+    if failedProbeOrReadThisWarmup then
+        logRateLimited("full-ready-blocked-warmup-failure",
+            "[CrabSync:lifecycle] full sync blocked: probe/read failure during warmup\n")
+        return nil
+    end
+
+    local roleOk, roleReason = isRoleFullSyncEligible(ctx.role)
+    if not roleOk then
+        logRateLimited("full-ready-blocked-" .. tostring(roleReason),
+            "[CrabSync:lifecycle] full sync blocked: " .. tostring(roleReason) .. "\n")
+        return nil
+    end
+
+    local ps = ctx.ps
+    if not isValidObject(ps) then
+        failedProbeOrReadThisWarmup = true
+        suspendLifecycle("PlayerState invalid before local read")
+        return nil
+    end
+
+    crashBreadcrumb("local read", "enter")
+    local okRead, inv = pcall(function() return readShallowInventoryState(ps) end)
+    crashBreadcrumb("local read", "leave")
+    if not okRead or not inv or inv._shallowReadOk ~= true then
+        if not okRead then failedProbeOrReadThisWarmup = true end
+        logRateLimited("full-ready-blocked-local-read",
+            "[CrabSync:lifecycle] full sync blocked: waiting for successful local read\n")
+        return nil
+    end
+
+    if not hasSuccessfulLocalReadThisGeneration then
+        print(string.format(
+            "[CrabSync:lifecycle] first local read succeeded generation=%d\n",
+            lifecycleGeneration))
+    end
+    hasSuccessfulLocalReadThisGeneration = true
+
+    if not ALLOW_DEEP_ITEM_ARRAY_READ then
+        logRateLimited("full-ready-blocked-deep-disabled",
+            "[CrabSync:lifecycle] full sync blocked: deep item array read disabled by config\n")
+        return nil
+    end
+
+    if itemArrayWarmupTicks < ITEM_ARRAY_WARMUP_TICKS_REQUIRED then
+        itemArrayWarmupTicks = itemArrayWarmupTicks + 1
+        crashBreadcrumb("item array warmup tick", tostring(itemArrayWarmupTicks) .. "/" .. tostring(ITEM_ARRAY_WARMUP_TICKS_REQUIRED))
+        if itemArrayWarmupTicks == 1 then
+            print(string.format(
+                "[CrabSync:lifecycle] item array warmup started ticks=%d generation=%d\n",
+                ITEM_ARRAY_WARMUP_TICKS_REQUIRED, lifecycleGeneration))
+        end
+        if itemArrayWarmupTicks >= ITEM_ARRAY_WARMUP_TICKS_REQUIRED then
+            itemArrayDeepReadReady = true
+            lastItemArrayReadFailed = false
+            print(string.format(
+                "[CrabSync:lifecycle] item array warmup completed generation=%d\n",
+                lifecycleGeneration))
+        end
+        return nil
+    end
+
+    if not itemArrayDeepReadReady then
+        itemArrayDeepReadReady = true
+        lastItemArrayReadFailed = false
+    end
+    if lastItemArrayReadFailed then
+        logRateLimited("full-ready-blocked-item-read-failed",
+            "[CrabSync:lifecycle] full sync blocked: item array read not ready\n")
+        return nil
+    end
+
+    crashBreadcrumb("fullSyncReady transition", "enter")
+    fullSyncReady = true
+    hasCompletedCleanFullReadyLoop = false
+    firstFullSyncReadyAt = currentPollTick
+    lastRecvJson = readCurrentRecvText()
+    lastRecvInvJson = ""
+    print(string.format(
+        "[CrabSync:lifecycle] full sync ready role=%s generation=%d\n",
+        tostring(ctx.role), lifecycleGeneration))
+    crashBreadcrumb("fullSyncReady transition", "leave")
+    return ctx
 end
 
 -- Write PUSH_FILE when inventory changed, plus a periodic keepalive rewrite.
@@ -2395,10 +2755,15 @@ local function pushIfChanged(ctx)
         .. ',"inventory":' .. payloadInvJson .. '}'
     local f = io.open(PUSH_FILE, "w")
     if f then
+        crashBreadcrumb("push write", "enter")
         f:write(payload)
         f:close()
+        crashBreadcrumb("push write", "leave")
         lastPushedJson = invJson   -- store only the inv portion for change detection
         lastPushAtSec  = nowSec
+        hasWrittenPushThisGeneration = true
+        lastRecvJson = readCurrentRecvText()
+        lastRecvInvJson = ""
         skipNextApply  = true      -- give bridge one tick to process push before we apply
         if SYNC_HEALTH and inv.healthValid ~= true then
             print("[CrabSync:health] health omitted from push\n")
@@ -2427,10 +2792,15 @@ local function applyIfChanged(ctx)
         print("[CrabSync] apply SKIPPED (post-push tick - letting bridge update recv)\n")
         return
     end
+    crashBreadcrumb("recv read", "enter")
     local f = io.open(RECV_FILE, "r")
-    if not f then return end
+    if not f then
+        crashBreadcrumb("recv read", "leave")
+        return
+    end
     local json = f:read("*a")
     f:close()
+    crashBreadcrumb("recv read", "leave")
     if json == "" or json == lastRecvJson then return end
 
     local inv = decodeInventory(json)
@@ -2471,9 +2841,54 @@ local function applyIfChanged(ctx)
 end
 
 local function pollTick()
+    if CONFIG_VALID == false then
+        logInvalidConfigDisabledOnce()
+        return
+    end
+
+    currentPollTick = currentPollTick + 1
+    crashBreadcrumb("pollTick", "enter")
+
+    if isTransitioning then
+        crashBreadcrumb("pollTick", "leave transitioning")
+        ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+        return
+    end
+
     local lifecycleContext = updateLifecycle()
+    if lifecycleChangedThisTick then
+        crashBreadcrumb("pollTick", "leave lifecycle changed")
+        ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+        return
+    end
+    if lifecycleState ~= "stable" or not lifecycleContext then
+        crashBreadcrumb("pollTick", "leave not stable")
+        ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+        return
+    end
+
+    lifecycleContext = runPostStableWarmup(lifecycleContext)
+    if not fullSyncReady or not lifecycleContext then
+        crashBreadcrumb("pollTick", "leave warming")
+        ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+        return
+    end
+    if firstFullSyncReadyAt == currentPollTick then
+        crashBreadcrumb("pollTick", "leave just full-ready")
+        ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
+        return
+    end
+
     pushIfChanged(lifecycleContext)
     applyIfChanged(lifecycleContext)
+    if fullSyncReady and not hasCompletedCleanFullReadyLoop then
+        hasCompletedCleanFullReadyLoop = true
+        print(string.format(
+            "[CrabSync:lifecycle] first full-ready loop completed generation=%d\n",
+            lifecycleGeneration))
+    end
+
+    crashBreadcrumb("pollTick", "leave")
     ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
 end
 
@@ -2484,11 +2899,12 @@ loadConfig()
 if CONFIG_VALID then
     autoLaunchBridge()
 else
-    print("[CrabInventorySync] Bridge not launched due to invalid config. Fix config.txt and restart the game.\n")
+    logInvalidConfigDisabledOnce()
 end
 
 -- Pause polling for 4 s during level transitions to avoid the 0xe06d7363 crash
 -- (PlayerState is mid-destruction when this hook fires; defer until safe).
+if CONFIG_VALID then
 RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
     isTransitioning = true
     suspendLifecycle("level transition")
@@ -2505,8 +2921,10 @@ RegisterHook("/Script/CrabChampions.CrabPC:ClientOnClearedIsland", function()
         print("[CrabInventorySync] Resuming lifecycle probe.\n")
     end)
 end)
+end
 
 -- F9: force an immediate re-push and re-apply on the very next tick.
+if CONFIG_VALID then
 RegisterKeyBind(Key.F9, function()
     -- NOTE: do NOT reset delta-tracking state (ownCrystals, ownHealth,
     -- ownMaxHealth, ownSlots).  Resetting them re-initialises each player's
@@ -2514,6 +2932,7 @@ RegisterKeyBind(Key.F9, function()
     suspendLifecycle("manual sync forced")
     print("[CrabInventorySync] Manual sync forced (F9).\n")
 end)
+end
 
 -- Kick off the poll loop.  First tick fires after one interval so the game
 -- has a moment to finish initialising before we start reading PlayerState.
@@ -2523,4 +2942,8 @@ if CONFIG_VALID then
     ExecuteWithDelay(POLL_INTERVAL_MS, pollTick)
 end
 
-print("[CrabInventorySync] Loaded. Syncing every " .. POLL_INTERVAL_MS .. " ms. Press F9 to force.\n")
+if CONFIG_VALID then
+    print("[CrabInventorySync] Loaded. Syncing every " .. POLL_INTERVAL_MS .. " ms. Press F9 to force.\n")
+else
+    logInvalidConfigDisabledOnce()
+end

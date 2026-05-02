@@ -69,8 +69,14 @@ Edit `Mods/CrabInventorySync/Scripts/config.txt`:
 | `allowScalarMetadataApply` | `false` | Safety gate for item `InventoryInfo` scalar writes; keep disabled |
 | `allowJoinedClientApply` | `false` | Joined clients are read-only/no-apply by default |
 | `allowMultiplayerApply` | `false` | Multiplayer live-state applies are disabled by default |
+| `allowJoinedClientRead` | `false` | Joined clients do not perform local inventory reads by default |
+| `allowUnknownRoleRead` | `false` | Unknown-role clients never read or sync by default |
+| `allowDeepItemArrayRead` | `true` | Diagnostic kill switch for mod/perk/relic TArray traversal |
 | `hostOnlyApply` | `true` | If multiplayer apply is enabled later, only host/solo roles may apply by default |
-| `lifecycleStableTicksRequired` | `5` | Consecutive stable shallow lifecycle probes required before sync reads/pushes/applies |
+| `lifecycleStableTicksRequired` | `5` | Consecutive shallow lifecycle probes required before entering stable |
+| `lifecycleStableWarmupTicks` | `10` | Extra post-stable ticks before any full inventory read or push |
+| `itemArrayWarmupTicksRequired` | `10` | Extra shallow-read ticks before deep item-array traversal |
+| `debugCrashBreadcrumbs` | `false` | Verbose before/after breadcrumbs around high-risk phases |
 | `crystalsProperty` | `Crystals` | Internal PlayerState property name for crystals |
 
 Runtime IPC files are per game launch: `push_<instance>.json` and
@@ -92,12 +98,15 @@ are detected and logged. Scalar metadata apply is quarantined by default with
 stable slot identity and duplicate-free pairing are proven.
 
 The client has a global lifecycle safety gate. On startup, join, travel, and
-manual reset it enters `suspended`, then `probing`, and only acts after several
-consecutive stable shallow probes. While unstable it does not read full
-inventory, push, apply recv, traverse item arrays deeply, or write equipment,
-crystals, slots, health, or item metadata. Joined clients are read-only/no-apply
-by default with `allowJoinedClientApply=false`; unknown roles are treated as
-unsafe. The contribution ledger for safe multiplayer apply is still pending.
+manual reset it enters `suspended`, then `probing`, then shallow `stable`. The
+tick that reaches shallow stable returns immediately, and full sync remains
+blocked through `lifecycleStableWarmupTicks`, a role eligibility check, a
+shallow same-generation local read, `itemArrayWarmupTicksRequired`, and one
+clean full-ready loop. Existing recv text is snapshotted during
+startup/reset/full-ready and ignored until the bridge writes something newer.
+Joined clients are read-only/no-read/no-apply by default; unknown roles do not
+read inventory, traverse item arrays, push, read/decode recv, or apply. The
+contribution ledger for safe multiplayer apply is still pending.
 
 ## Server dashboard
 

@@ -34,8 +34,16 @@ allowScalarMetadataApply = false
 # implemented and tested.
 allowJoinedClientApply = false
 allowMultiplayerApply = false
+allowJoinedClientRead = false
+allowUnknownRoleRead = false
+allowDeepItemArrayRead = true
 hostOnlyApply = true
 lifecycleStableTicksRequired = 5
+lifecycleStableWarmupTicks = 10
+itemArrayWarmupTicksRequired = 10
+
+# Verbose breadcrumbs around high-risk UE4SS/game-object phases.
+debugCrashBreadcrumbs = false
 
 # Internal PlayerState property name for crystals.
 # Health is not configured by property name: current HP is read from
